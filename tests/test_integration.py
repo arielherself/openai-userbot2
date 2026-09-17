@@ -1,0 +1,286 @@
+"""End to end against the real harness: no Telegram, no network.
+
+The harness's own test-suite is borrowed here — its scripted provider speaks real
+HTTP + SSE, and its fixture runs a real `HHServer` on an ephemeral port — so this
+exercises the real protocol rather than a stand-in: the local tool parks the turn
+for real, the fork really rewinds, and a failed turn really asks for its undo.
+
+Skipped when there is no harness checkout to point at (see HH_TEST_PROJECT).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import importlib.util
+import json
+import os
+import pathlib
+import socket
+import sys
+
+import pytest
+from support import FakeTelegram, bold_of, quotes_in, text_of
+
+from userbot.bridge import Bridge, Identity, Incoming
+from userbot.content import Content, Quoted
+from userbot.harness import HHClient, spawn_server
+from userbot.store import MappingStore
+
+pytestmark = pytest.mark.integration
+
+CHAT = -1001234567890
+
+PROJECT = pathlib.Path(os.environ.get("HH_TEST_PROJECT", "~/headless-harness")).expanduser()
+
+
+def _load_harness_support():
+    """The harness's test infrastructure, under a module name of its own."""
+    if not (PROJECT / "src" / "server.py").exists():
+        pytest.skip(
+            f"no headless-harness checkout at {PROJECT} (set HH_TEST_PROJECT)",
+            allow_module_level=True,
+        )
+    sys.path.insert(0, str(PROJECT / "tests"))
+    spec = importlib.util.spec_from_file_location(
+        "harness_support", PROJECT / "tests" / "support.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["harness_support"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+harness_support = _load_harness_support()
+
+
+class Fixture:
+    """A scripted provider and a real HHServer, torn down together."""
+
+    def __init__(self, tmp_path):
+        self.provider = harness_support.FakeProvider()
+        self.server = harness_support.ServerFixture(str(tmp_path), self.provider)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.server.stop()
+        self.provider.close()
+
+    def blocks(self) -> dict:
+        """Every block the server holds, by id — asked over its own protocol."""
+        with self.server.client() as client:
+            client.command("list_agents")
+            listed = client.wait_event("agents_listed")
+        return {block["agent_id"]: block for block in listed["agents"]}
+
+
+async def drive(fixture, store, conversation) -> FakeTelegram:
+    """Run messages through the bridge, against the real server."""
+    delivery = FakeTelegram()
+    harness = HHClient(fixture.server.host, fixture.server.port)
+    await harness.connect()
+    try:
+        bridge = Bridge(
+            harness,
+            store,
+            delivery,
+            status_interval=0.0,
+            identity=Identity(name="小助手", username="mybot", user_id=4242),
+        )
+        for message in conversation:
+            await bridge.handle(message)
+    finally:
+        await harness.close()
+    return delivery
+
+
+def mention(message_id=50, text="帮我查一下 @bot", media="") -> Incoming:
+    return Incoming(
+        chat_id=CHAT,
+        message_id=message_id,
+        content=Content(text=text, media=media),
+        sender_id=7,
+        sender_name="小明",
+        sender_username="ming",
+        chat_title="测试群",
+        chat_username="testgroup",
+        is_group=True,
+        mentioned=True,
+    )
+
+
+def reply_to(message_id=51, to=1000, text="再详细一点", quoted=None) -> Incoming:
+    return Incoming(
+        chat_id=CHAT,
+        message_id=message_id,
+        content=Content(text=text),
+        sender_id=7,
+        sender_name="小明",
+        sender_username="ming",
+        chat_title="测试群",
+        chat_username="testgroup",
+        is_group=True,
+        mentioned=False,
+        reply_to_message_id=to,
+        quoted=quoted,
+    )
+
+
+def test_a_draft_round_trip_and_the_reply_that_follows_it(tmp_path):
+    with Fixture(tmp_path) as fixture:
+        store = MappingStore(str(tmp_path / "mappings.db"))
+        try:
+            fixture.provider.tool_call(
+                "tg_draft_response",
+                {"summary": "答案是 42", "details": "细节里还有 **粗体**。"},
+            )
+            fixture.provider.text("已经回答了。")
+            delivery = asyncio.run(drive(fixture, store, [mention()]))
+
+            status, answer = delivery.sent[0], delivery.sent[1]
+            assert status["reply_to"] == 50
+            assert delivery.deleted == [(CHAT, (status["id"],))]
+            assert text_of(answer) == "细节里还有 粗体。"
+            assert bold_of(answer) == ["粗体"]
+            assert quotes_in(answer)[0].collapsed is True
+
+            first = store.lookup(CHAT, answer["id"])
+            assert first is not None
+            blocks = fixture.blocks()
+            assert blocks[first]["outcome"] == "ok"
+            local = blocks[first]["local_tools"]
+            assert "tg_draft_response" in [
+                item["name"] if isinstance(item, dict) else item for item in local
+            ]
+
+            # replying to the answer joins that conversation instead of starting one
+            fixture.provider.tool_call(
+                "tg_draft_response", {"summary": "补充", "details": "补充的细节"}
+            )
+            fixture.provider.text("补完了。")
+            follow_up = asyncio.run(drive(fixture, store, [reply_to(to=answer["id"])]))
+            assert follow_up.sent[1]["reply_to"] == 51
+            second = store.lookup(CHAT, follow_up.sent[1]["id"])
+            blocks = fixture.blocks()
+            assert blocks[second]["parent"] == first
+            # it carries the whole exchange: the prompt, the tool call, the answer
+            assert blocks[second]["context_len"] > blocks[first]["context_len"]
+        finally:
+            store.close()
+
+
+def test_a_failed_turn_reports_itself_and_takes_the_reply_back(tmp_path):
+    with Fixture(tmp_path) as fixture:
+        store = MappingStore(str(tmp_path / "mappings.db"))
+        try:
+            fixture.provider.tool_call(
+                "tg_draft_response", {"summary": "先发出去", "details": "这段会被撤回"}
+            )
+            fixture.provider.error(status=500, body=b"the provider fell over")
+            delivery = asyncio.run(drive(fixture, store, [mention()]))
+
+            answer = delivery.sent[1]
+            # the failed turn undid its own tool call: the messages went away again
+            assert (CHAT, (answer["id"],)) in delivery.deleted
+            assert "这段会被撤回" in answer["text"]
+
+            live = [
+                message for message in delivery.live() if message["id"] != delivery.sent[0]["id"]
+            ]
+            failure = live[-1]
+            assert "agent failed" in failure["text"]
+            assert failure["reply_to"] == 50
+            assert store.lookup(CHAT, failure["id"]) is not None
+        finally:
+            store.close()
+
+
+def test_the_quoted_message_reaches_the_provider(tmp_path):
+    """What the agent is asked is written into the request the provider really gets."""
+    with Fixture(tmp_path) as fixture:
+        store = MappingStore(str(tmp_path / "mappings.db"))
+        try:
+            fixture.provider.tool_call(
+                "tg_draft_response", {"summary": "看了", "details": "是一份 PDF。"}
+            )
+            fixture.provider.text("已回复。")
+            message = reply_to(
+                to=999,
+                text="这是什么？",
+                quoted=Quoted(
+                    content=Content(
+                        text="看这个",
+                        media=(
+                            "[file: report.pdf (application/pdf, 1.2 MB)]\n"
+                            "[instant view: https://t.me/iv?url=https%3A%2F%2Fexample.com&rhash=ab]"
+                        ),
+                    ),
+                    sender_name="小红",
+                    sender_id=9,
+                    sender_username="hong",
+                ),
+            )
+            message.mentioned = True
+            asyncio.run(drive(fixture, store, [message]))
+
+            sent = json.dumps(fixture.provider.payloads()[0], ensure_ascii=False)
+            assert "on behalf of the userbot 小助手 (@mybot, user id 4242)" in sent
+            assert "replying to 小红 (@hong, user id 9)" in sent
+            assert "看这个" in sent
+            assert "report.pdf" in sent
+            assert "instant view" in sent
+            assert "这是什么？" in sent
+        finally:
+            store.close()
+
+
+def test_a_turn_that_never_says_anything_leaves_no_status_message(tmp_path):
+    """The status message waits for the harness to produce something."""
+    with Fixture(tmp_path) as fixture:
+        store = MappingStore(str(tmp_path / "mappings.db"))
+        try:
+            fixture.provider.error(status=500, body=b"the provider fell over")
+            delivery = asyncio.run(drive(fixture, store, [mention()]))
+
+            assert len(delivery.sent) == 1  # just the failure notice
+            assert delivery.sent[0]["reply_to"] == 50
+            assert "agent failed" in delivery.sent[0]["text"]
+            assert delivery.edits == []
+        finally:
+            store.close()
+
+
+def test_a_reply_to_a_message_we_never_sent_is_ignored(tmp_path):
+    with Fixture(tmp_path) as fixture:
+        store = MappingStore(str(tmp_path / "mappings.db"))
+        try:
+            delivery = asyncio.run(drive(fixture, store, [reply_to(to=999)]))
+            assert delivery.sent == []
+            assert fixture.provider.count == 0
+        finally:
+            store.close()
+
+
+def test_the_harness_can_be_started_for_us(tmp_path):
+    """The path `--no-spawn` turns off: run `src/server.py`, wait for its port."""
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+
+    process = spawn_server("127.0.0.1", port, str(PROJECT), db=str(tmp_path / "harness.db"))
+
+    async def scenario():
+        client = HHClient("127.0.0.1", port)
+        await client.connect()
+        try:
+            assert client.hello["protocol"] == 2
+            assert client.hello["store"]["blocks"] == 0
+        finally:
+            await client.close()
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        process.terminate()
+        process.wait(timeout=10)
