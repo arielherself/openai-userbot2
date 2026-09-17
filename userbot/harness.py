@@ -311,14 +311,26 @@ class HHClient:
             subscription.close()
 
     async def resolve_tool(
-        self, agent_id: str, call_id: str, result: str | None = None, error: str | None = None
+        self,
+        agent_id: str,
+        call_id: str,
+        result: str | None = None,
+        error: str | None = None,
+        images: list[str] | None = None,
     ) -> bool:
-        """Answer a parked local tool call (or the undo of one)."""
+        """Answer a parked local tool call (or the undo of one).
+
+        `images`, when given, ride along with the result as `data:` URIs, so the
+        model sees them the way it sees a fork's images. An answer that carries an
+        error drops them: a failed call is text.
+        """
         fields: dict = {"command": "resolve_tool", "id": agent_id, "call_id": call_id}
         if error is not None:
             fields["error"] = error
         else:
             fields["result"] = "" if result is None else result
+            if images:
+                fields["images"] = list(images)
         try:
             await self.command(**fields)
             return True

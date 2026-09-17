@@ -5,7 +5,16 @@ from __future__ import annotations
 import asyncio
 import time
 
-from support import FakeHarness, FakeTelegram, bold_of, bot_message, quotes_in, text_of
+from support import (
+    FakeHarness,
+    FakeTelegram,
+    bold_of,
+    bot_message,
+    chat_message,
+    chat_view,
+    quotes_in,
+    text_of,
+)
 
 from userbot.bridge import Bridge, Identity, Incoming
 from userbot.content import Content, Quoted
@@ -23,7 +32,12 @@ class ScriptedAgent:
     """
 
     #: the tools that declare a rollback, so a failed turn offers their undo
-    ROLLBACKS = ("tg_draft_response", "tg_send_music", "tg_send_parsed_content")
+    ROLLBACKS = (
+        "tg_draft_response",
+        "tg_send_music",
+        "tg_send_parsed_content",
+        "tg_forward_message",
+    )
 
     def __init__(
         self,
@@ -386,6 +400,10 @@ def test_a_mention_opens_a_conversation_and_delivers_the_draft(tmp_path):
                 "tg_search_music",
                 "tg_send_music",
                 "tg_send_parsed_content",
+                "tg_view_current_chat",
+                "tg_view_public_chat",
+                "tg_read_message",
+                "tg_forward_message",
             ]
             assert created["local_tools"][0]["rollback"] is True
             # the harness must be willing to wait at least as long as the music
@@ -402,6 +420,10 @@ def test_a_mention_opens_a_conversation_and_delivers_the_draft(tmp_path):
                 "tg_search_music",
                 "tg_send_music",
                 "tg_send_parsed_content",
+                "tg_view_current_chat",
+                "tg_view_public_chat",
+                "tg_read_message",
+                "tg_forward_message",
             ]
             assert fork["local_timeout"] >= 300
 
@@ -449,6 +471,10 @@ def test_a_reply_continues_the_conversation_it_answered(tmp_path):
                 "tg_search_music",
                 "tg_send_music",
                 "tg_send_parsed_content",
+                "tg_view_current_chat",
+                "tg_view_public_chat",
+                "tg_read_message",
+                "tg_forward_message",
             ]
             assert "replies to one you sent earlier" in fork["prompt"]
             assert delivery.sent[1]["reply_to"] == 51
@@ -975,6 +1001,298 @@ def test_a_parse_that_never_answers_reaches_the_agent_as_an_error(tmp_path):
             assert agent.outcomes["call_1"] is False
             assert "said nothing within" in agent.answer_for("call_1")["error"]
             assert delivery.forwarded == []
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_the_agent_can_read_the_chat_it_is_in(tmp_path):
+    agent = ScriptedAgent(
+        calls=[
+            ("tg_view_current_chat", {}),
+            ("tg_draft_response", {"summary": "看了", "details": "你们在聊天气。"}),
+        ]
+    )
+
+    def ready(delivery):
+        delivery.chats[-100] = chat_view(
+            title="测试群",
+            username="testgroup",
+            chat_id=-100,
+            messages=[chat_message(text="今天天气不错")],
+        )
+
+    async def scenario():
+        _, _, store = await run_bridge(agent, mention(), tmp_path, delivery_ready=ready)
+        try:
+            result = agent.answer_for("call_1")["result"]
+            assert "the last 1 message(s) in 测试群 (@testgroup), -100" in result
+            assert "今天天气不错" in result
+            assert agent.outcomes["call_1"] is True
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_an_unreadable_public_chat_reaches_the_agent_as_an_error(tmp_path):
+    agent = ScriptedAgent(
+        calls=[
+            ("tg_view_public_chat", {"username": "@nobody"}),
+            ("tg_draft_response", {"summary": "s", "details": "d"}),
+        ]
+    )
+
+    async def scenario():
+        _, _, store = await run_bridge(agent, mention(), tmp_path)
+        try:
+            assert agent.outcomes["call_1"] is False
+            assert "could not read that chat" in agent.answer_for("call_1")["error"]
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_username_that_is_not_one_is_refused_before_any_lookup(tmp_path):
+    agent = ScriptedAgent(
+        calls=[
+            ("tg_view_public_chat", {"username": "testgroup"}),
+            ("tg_draft_response", {"summary": "s", "details": "d"}),
+        ]
+    )
+
+    async def scenario():
+        _, delivery, store = await run_bridge(agent, mention(), tmp_path)
+        try:
+            # refused before the lookup: the chat was never asked for, so the fake
+            # (which knows no chats here) was never consulted
+            assert "must start with @" in agent.answer_for("call_1")["error"]
+            assert delivery.chats == {}
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_message_can_be_read_and_forwarded_by_id(tmp_path):
+    agent = ScriptedAgent(
+        calls=[
+            ("tg_read_message", {"message_id": 41}),
+            ("tg_forward_message", {"message_id": 41}),
+            ("tg_draft_response", {"summary": "找到了", "details": "就是上面那条。"}),
+        ]
+    )
+
+    def ready(delivery):
+        delivery.chats[-100] = chat_view(
+            chat_id=-100, messages=[chat_message(id=41, text="很久以前的消息")]
+        )
+
+    async def scenario():
+        harness, delivery, store = await run_bridge(
+            agent, mention(), tmp_path, delivery_ready=ready
+        )
+        try:
+            read = agent.answer_for("call_1")["result"]
+            assert "[41] " in read and "很久以前的消息" in read
+            assert "forwarded into this chat" in agent.answer_for("call_2")["result"]
+            assert delivery.forwarded[-1]["to"] == -100
+            # the forwarded copy is the userbot's message: replying continues here
+            forwarded_id = delivery.forwarded[0]["id"]
+            assert store.lookup(-100, forwarded_id) == harness.commands_named("fork")[0]["new_id"]
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_message_id_that_makes_no_sense_is_refused(tmp_path):
+    agent = ScriptedAgent(
+        calls=[
+            ("tg_read_message", {"message_id": "not a number"}),
+            ("tg_draft_response", {"summary": "s", "details": "d"}),
+        ]
+    )
+
+    async def scenario():
+        _, delivery, store = await run_bridge(agent, mention(), tmp_path)
+        try:
+            assert agent.outcomes["call_1"] is False
+            assert "must be a number" in agent.answer_for("call_1")["error"]
+            assert delivery.forwarded == []
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_message_from_another_chat_can_be_forwarded_here(tmp_path):
+    """The failure that started this: an id that belongs to another chat."""
+    agent = ScriptedAgent(
+        calls=[
+            ("tg_forward_message", {"message_id": 16193, "from_chat": "@elsewhere"}),
+            ("tg_draft_response", {"summary": "转过来了", "details": "看上面。"}),
+        ]
+    )
+
+    def ready(delivery):
+        delivery.chats["@elsewhere"] = chat_view(
+            title="别的群",
+            username="elsewhere",
+            chat_id=-200,
+            messages=[chat_message(id=16193, text="那边的一条消息")],
+        )
+
+    async def scenario():
+        harness, delivery, store = await run_bridge(
+            agent, mention(), tmp_path, delivery_ready=ready
+        )
+        try:
+            assert agent.outcomes["call_1"] is True
+            assert delivery.forwarded == [
+                {
+                    "id": delivery.forwarded[0]["id"],
+                    "from": "@elsewhere",
+                    "message_id": 16193,
+                    "to": -100,
+                }
+            ]
+            forwarded_id = delivery.forwarded[0]["id"]
+            assert store.lookup(-100, forwarded_id) == harness.commands_named("fork")[0]["new_id"]
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_bad_source_chat_is_refused_before_any_lookup(tmp_path):
+    agent = ScriptedAgent(
+        calls=[
+            ("tg_forward_message", {"message_id": 16193, "from_chat": "elsewhere"}),
+            ("tg_draft_response", {"summary": "s", "details": "d"}),
+        ]
+    )
+
+    async def scenario():
+        _, delivery, store = await run_bridge(agent, mention(), tmp_path)
+        try:
+            assert agent.outcomes["call_1"] is False
+            assert "must be a chat name" in agent.answer_for("call_1")["error"]
+            assert delivery.forwarded == []
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_the_pictures_of_what_is_asked_travel_with_the_fork(tmp_path):
+    agent = ScriptedAgent()
+    quoted = Quoted(
+        content=Content(text="看这个"),
+        sender_name="小红",
+        sender_id=9,
+        images=["data:image/jpeg;base64,quoted"],
+    )
+
+    async def scenario():
+        message = reply_to(to=999, text="这是什么？", quoted=quoted)
+        message.mentioned = True
+        message.images = ["data:image/jpeg;base64,current"]
+        harness, _, store = await run_bridge(agent, message, tmp_path)
+        try:
+            fork = harness.commands_named("fork")[0]
+            # the quoted picture first, then the message's own — the order the
+            # prompt reads in
+            assert fork["images"] == [
+                "data:image/jpeg;base64,quoted",
+                "data:image/jpeg;base64,current",
+            ]
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_harness_that_does_not_know_images_gets_none(tmp_path):
+    agent = ScriptedAgent()
+
+    async def scenario():
+        message = mention()
+        message.images = ["data:image/jpeg;base64,current"]
+        harness = await FakeHarness(agent, protocol=2).start()
+        client = HHClient(harness.host, harness.port)
+        await client.connect()
+        store = MappingStore(str(tmp_path / "mappings.db"))
+        try:
+            await Bridge(client, store, FakeTelegram(), status_interval=0.0).handle(message)
+            assert "images" not in harness.commands_named("fork")[0]
+        finally:
+            await client.close()
+            await harness.stop()
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_read_message_hands_its_pictures_to_the_model(tmp_path):
+    agent = ScriptedAgent(
+        calls=[
+            ("tg_read_message", {"message_id": 41}),
+            ("tg_draft_response", {"summary": "看了", "details": "是一只猫。"}),
+        ]
+    )
+
+    def ready(delivery):
+        delivery.chats[-100] = chat_view(
+            chat_id=-100,
+            messages=[chat_message(id=41, text="看这个", images=["data:image/jpeg;base64,cat"])],
+        )
+
+    async def scenario():
+        _, _, store = await run_bridge(agent, mention(), tmp_path, delivery_ready=ready)
+        try:
+            answer = agent.answer_for("call_1")
+            assert answer["images"] == ["data:image/jpeg;base64,cat"]
+            assert "看这个" in answer["result"]
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_failed_read_answers_without_pictures(tmp_path):
+    agent = ScriptedAgent(
+        calls=[
+            ("tg_read_message", {"message_id": 999}),
+            ("tg_draft_response", {"summary": "s", "details": "d"}),
+        ]
+    )
+
+    def ready(delivery):
+        delivery.chats[-100] = chat_view(chat_id=-100)
+
+    async def scenario():
+        _, _, store = await run_bridge(agent, mention(), tmp_path, delivery_ready=ready)
+        try:
+            answer = agent.answer_for("call_1")
+            assert "images" not in answer and "error" in answer
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_mention_in_a_draft_goes_out_without_pinging_anyone(tmp_path):
+    agent = ScriptedAgent(summary="回复 @小明", details="也可以问 **@channel**")
+
+    async def scenario():
+        _, delivery, store = await run_bridge(agent, mention(), tmp_path)
+        try:
+            reply = [one for one in delivery.sent if one["chat_id"] == -100][-1]
+            assert reply["text"] == "回复 #小明\n\n也可以问 #channel"
+            assert bold_of(reply) == ["#channel"]
         finally:
             store.close()
 

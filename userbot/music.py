@@ -19,8 +19,9 @@ import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from .relay import Answer, ask
+from .relay import ask
 from .telegram import BotMessage, Delivery
+from .tools import Answer
 
 # @Music163DownBot — the account that fetches the tracks.
 MUSIC_BOT = "Music163DownBot"

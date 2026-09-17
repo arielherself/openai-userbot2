@@ -151,11 +151,16 @@ def test_a_draft_round_trip_and_the_reply_that_follows_it(tmp_path):
             assert blocks[first]["outcome"] == "ok"
             local = blocks[first]["local_tools"]
             names = [item["name"] if isinstance(item, dict) else item for item in local]
-            assert names == [
+            # the server keeps them in name order, whatever order we declared them
+            assert sorted(names) == [
                 "tg_draft_response",
+                "tg_forward_message",
+                "tg_read_message",
                 "tg_search_music",
                 "tg_send_music",
                 "tg_send_parsed_content",
+                "tg_view_current_chat",
+                "tg_view_public_chat",
             ]
 
             # replying to the answer joins that conversation instead of starting one
@@ -173,11 +178,15 @@ def test_a_draft_round_trip_and_the_reply_that_follows_it(tmp_path):
                 item["name"] if isinstance(item, dict) else item
                 for item in blocks[second]["local_tools"]
             ]
-            assert names == [
+            assert sorted(names) == [
                 "tg_draft_response",
+                "tg_forward_message",
+                "tg_read_message",
                 "tg_search_music",
                 "tg_send_music",
                 "tg_send_parsed_content",
+                "tg_view_current_chat",
+                "tg_view_public_chat",
             ]
             # it carries the whole exchange: the prompt, the tool call, the answer
             assert blocks[second]["context_len"] > blocks[first]["context_len"]
@@ -289,7 +298,7 @@ def test_the_harness_can_be_started_for_us(tmp_path):
         client = HHClient("127.0.0.1", port)
         await client.connect()
         try:
-            assert client.hello["protocol"] == 2
+            assert client.hello["protocol"] >= 3  # images ride on fork and resolve_tool
             assert client.hello["store"]["blocks"] == 0
         finally:
             await client.close()

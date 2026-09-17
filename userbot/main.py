@@ -22,7 +22,7 @@ from .config import Config
 from .content import Quoted, content_of
 from .harness import HHClient, is_listening, spawn_server
 from .store import MappingStore
-from .telegram import TelethonDelivery
+from .telegram import TelethonDelivery, images_of, sender_of
 
 log = logging.getLogger("userbot")
 
@@ -50,7 +50,7 @@ def mentions_us(message, me) -> bool:
     )
 
 
-async def quoted_from(message, me) -> Quoted | None:
+async def quoted_from(message, me, client) -> Quoted | None:
     """The message this one replies to — unless it is one of ours.
 
     A reply to our own message needs no quote: the turn forks from the block that
@@ -65,13 +65,15 @@ async def quoted_from(message, me) -> Quoted | None:
     reply = await message.get_reply_message()
     if not isinstance(reply, TelegramMessage) or reply.out or reply.sender_id == me.id:
         return None
-    sender = await reply.get_sender()
+    sender = await sender_of(reply)
     return Quoted(
         content=content_of(reply),
-        sender_name=utils.get_display_name(sender) or "",
-        sender_id=reply.sender_id or 0,
-        sender_username=getattr(sender, "username", None),
+        sender_name=sender.name,
+        sender_id=sender.user_id,
+        sender_username=sender.username,
         excerpt=(getattr(header, "quote_text", None) or "").strip(),
+        # what the sender is pointing at, pictures included
+        images=await images_of(client, reply),
     )
 
 
@@ -83,22 +85,23 @@ async def incoming_from(event, me, since: float) -> Incoming | None:
     if message.date.timestamp() < since - CLOCK_SLACK:
         return None  # the backlog of a userbot that was offline
     chat = await event.get_chat()
-    sender = await event.get_sender()
-    if getattr(sender, "bot", False):
+    sender = await sender_of(message)
+    if getattr(await event.get_sender(), "bot", False):
         return None  # another bot talking to us: never answered, never logged
     return Incoming(
         chat_id=utils.get_peer_id(chat),
         message_id=message.id,
         content=content_of(message),
-        sender_id=message.sender_id or 0,
-        sender_name=utils.get_display_name(sender) or "unknown",
-        sender_username=getattr(sender, "username", None),
+        sender_id=sender.user_id,
+        sender_name=sender.name,
+        sender_username=sender.username,
         chat_title=utils.get_display_name(chat) or None,
         chat_username=getattr(chat, "username", None),
         is_group=bool(event.is_group),
         mentioned=mentions_us(message, me),
         reply_to_message_id=message.reply_to_msg_id,
-        quoted=await quoted_from(message, me),
+        quoted=await quoted_from(message, me, event.client),
+        images=await images_of(event.client, message),
     )
 
 

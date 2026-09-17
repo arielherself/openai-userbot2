@@ -73,6 +73,35 @@ Two more tools talk to a third-party music bot, [@Music163DownBot](https://t.me/
 | `tg_search_music(keyword, platform)` | the bot is sent `/search <keyword> <code>` and its listing comes back as the tool result — a numbered song per line, each with its link, **as the bot wrote it**: Telegram turns a bot's Markdown into message entities, so the text is re-rendered with its links (`[title](link)`) rather than handed over with them stripped. An edit that adds the keyboard counts as the answer too, which is how that bot delivers it. |
 | `tg_send_music(url, platform)` | the bot is sent `/music <url> <code>`, and the audio file it returns is **forwarded into the chat**; a refusal comes back as the tool result instead |
 
+### Reading a chat
+
+| tool | what it does |
+|---|---|
+| `tg_view_current_chat()` | reads this chat's last 50 messages |
+| `tg_view_public_chat(username)` | reads the last 50 of a public group or channel, named like `@telegram` |
+| `tg_read_message(message_id, from_chat?)` | reads one message by the id the tools above print in brackets |
+| `tg_forward_message(message_id, from_chat?)` | forwards one message into this chat, so it lands at the end |
+
+Each message comes back oldest-first with its **message id**, the time it was
+sent (in the machine's own timezone, offset included), its sender — display name,
+`@username` when there is one, user id — and its full content, using the same
+media placeholders as the prompts. A message whose author Telegram hides fits the
+same shape: an anonymous admin has no id or username to print, so it shows the
+signature it posts under, or simply `anonymous admin`, rather than a `user id 0`
+that means nothing. Being hidden says nothing about the media: a picture an
+anonymous admin posted is fetched and passed on like any other, because the file
+carries its own reference and never needed a sender. The result opens with the chat it read, so it is
+clear what was looked at. A chat with nothing in it is an answer, not a failure;
+a username without the `@`, a chat that cannot be resolved, a message id that is
+not there, and a read Telegram refuses all come back as tool errors. Both
+single-message tools also take an optional `from_chat` — a public `@name` or the
+chat id the view tools printed — so a message can be read or forwarded out of
+another chat; leaving it out means this one, and the error for a missing message
+says which chat it looked in. The two
+reading tools declare no rollback and change nothing; a forwarded message is
+recorded against the block like the other forwards, and deleted again if the turn
+that made it fails.
+
 ### Parsed content
 
 | tool | what happens |
@@ -112,6 +141,9 @@ back to the next platform or tell the user what happened. A refusal from the bot
 ("fail: …") is not an error: it is the tool's result, passed on verbatim.
 `tg_send_music` declares a rollback, so a turn that fails after the file went out
 deletes it again — and drops its mapping, like the reply's.
+
+A draft is published with every `@` shown as `#`: Telegram reads an `@name` as a
+mention, which would notify whoever the agent happened to name.
 
 The details are wrapped in a **collapsed blockquote**. Telegram caps a message at
 4096 characters, so a long `details` becomes several messages — each keeping its
@@ -210,6 +242,26 @@ uv run python -m userbot --harness-port 8765 --db userbot.db
 | `--turn-timeout` | `USERBOT_TURN_TIMEOUT` | `3600` | give up on a turn after this long |
 | `--log-level` | `USERBOT_LOG_LEVEL` | `INFO` | logging |
 
+## Pictures
+
+The harness takes images next to a prompt, and next to a tool result (protocol 3),
+so the agent can look at what it is being asked about instead of reading a
+placeholder. The userbot fetches them from Telegram as `data:` URIs — a photo, a
+picture sent as a file, or a **frame of a video** (its thumbnail) — and only for
+three things:
+
+- the message that mentioned it,
+- the message the sender quoted or replied to (when that is somebody else's, so
+  the prompt carries its text anyway),
+- a message read with `tg_read_message`, which is why its description says the
+  pictures come back with it.
+
+Everything else keeps the placeholder: the history the view tools print stays
+text, and so does a message whose picture Telegram will not hand over. At most
+four pictures ride along, each capped at 3 MiB and the lot at 5 MiB of base64,
+because they travel in the same JSON line as the prompt. A harness that reports
+protocol `2` is sent none — it would ignore the field.
+
 ## The mapping store
 
 Answers have to be continuable, so every message the userbot sends is recorded
@@ -234,7 +286,11 @@ auto-vacuum hands them back, so the file stays near the budget.
   normal message); there the prompt simply has no `group:` line.
 - A message from another bot is ignored outright, mention or not: bots do not get
   answers, and their messages are not logged.
-- The agent sees the message text as written, mention included.
+- The agent sees the message text as written, mention included. A hidden sender
+  (an anonymous admin) is named the same way everywhere: the signature it posts
+  under, or `anonymous admin`, with no invented id.
+- Pictures are fetched only for what the agent is looking at *now* — the new
+  message, what it quotes, or one it asked to read — never for a history listing.
 - Messages that arrived while the userbot was offline are ignored.
 - Replying to somebody else's message is quoted into the prompt; replying to the
   userbot's own message continues that conversation instead of quoting it back.
@@ -265,7 +321,9 @@ userbot/render.py    the draft: bold-only markdown, collapsed quote, splitting
 userbot/content.py   what a message carries: text, media placeholders, Instant Views
 userbot/music.py     the two tools that reach the music bot
 userbot/parse.py     the tool that has the parse bot render a link
+userbot/history.py   the tools that read a chat, one message, or forward it
 userbot/relay.py     the shape both share: ask a bot, wait for its answer
+userbot/tools.py     what the local tools share: their answer, their arguments
 userbot/harness.py   the harness wire protocol, one connection, many conversations
 userbot/status.py    the single status message, and its rate limit
 userbot/bridge.py    the rules: what is answered, where the turn forks, what is sent

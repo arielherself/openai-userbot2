@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import asyncio
 
-from .relay import Answer, ask
+from .relay import ask
 from .telegram import BotMessage, Delivery
+from .tools import Answer
 
 # @ParseHubot — the account that renders the pages.
 PARSE_BOT = "ParseHubot"

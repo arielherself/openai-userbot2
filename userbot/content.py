@@ -48,9 +48,10 @@ class Quoted:
 
     content: Content = field(default_factory=Content)
     sender_name: str = ""
-    sender_id: int = 0
+    sender_id: int | None = None
     sender_username: str | None = None
     excerpt: str = ""  # the part the sender highlighted, if they quoted a selection
+    images: list[str] = field(default_factory=list)  # its pictures, as `data:` URIs
 
 
 # --- a message --------------------------------------------------------------

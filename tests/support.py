@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import replace
+from datetime import datetime, timezone
 
-from userbot.telegram import BotMessage
+from userbot.content import Content
+from userbot.telegram import BotMessage, ChatMessage, ChatView
 
 DEFAULTS = {"endpoint": "https://provider.invalid/v1", "model": "fake-model", "has_key": True}
 
@@ -32,9 +35,10 @@ class FakeHarness:
     whatever that command's events should be.
     """
 
-    def __init__(self, script, defaults=None) -> None:
+    def __init__(self, script, defaults=None, protocol=3) -> None:
         self.script = script
         self.defaults = dict(defaults or DEFAULTS)
+        self.protocol = protocol  # 3 is the version that carries images
         self.commands: list[dict] = []
         self.connections: list[Conn] = []
         self.host = "127.0.0.1"
@@ -66,7 +70,7 @@ class FakeHarness:
         self._writers.append(writer)
         await conn.emit(
             event="session_hello",
-            protocol=2,
+            protocol=self.protocol,
             server="fake",
             peer="",
             started_at=0,
@@ -116,6 +120,9 @@ class FakeTelegram:
         # Called with (chat_id, text) after a send, so a test can script the reply
         # the way a real bot would produce it.
         self.on_send = None
+        # What a chat holds, for the tools that read history: id or @username -> view.
+        self.chats: dict = {}
+        self.fail_history = False
         self._next_id = 1000
         self._listeners: list[tuple] = []
 
@@ -147,6 +154,31 @@ class FakeTelegram:
         # hands over everything the chat says from then on.
         self._listeners.append(chat_id)
         return _FakeListener(self, chat_id)
+
+    async def recent_messages(self, chat_id, limit=50) -> ChatView:
+        if self.fail_history:
+            raise RuntimeError("telegram said no")
+        try:
+            view = self.chats[chat_id]
+        except KeyError:
+            raise ValueError(f"no such chat: {chat_id}") from None
+        return ChatView(
+            title=view.title,
+            username=view.username,
+            chat_id=view.chat_id,
+            messages=list(view.messages[-limit:]),  # the newest, as Telegram gives them
+        )
+
+    async def message(self, chat_id, message_id, images=False):
+        if self.fail_history:
+            raise RuntimeError("telegram said no")
+        view = self.chats.get(chat_id)
+        if view is None:
+            raise ValueError(f"no such chat: {chat_id}")
+        found = next((one for one in view.messages if one.id == message_id), None)
+        if found is None or images:
+            return found
+        return replace(found, images=[])  # pictures only when they were asked for
 
     async def forward(self, chat_id, message_id, to_chat_id) -> int:
         if self.fail_forward:
@@ -243,3 +275,41 @@ def _text_and_entities(sent):
 def _slice(text: str, offset: int, length: int) -> str:
     raw = text.encode("utf-16-le")
     return raw[offset * 2 : (offset + length) * 2].decode("utf-16-le", "ignore")
+
+
+#: What a message in a test is stamped with, unless the test says otherwise.
+SENT_AT = datetime(2026, 9, 18, 4, 12, tzinfo=timezone.utc)
+
+
+def chat_message(
+    id=1, name="小明", username="ming", user_id=7, text="", media="", date=SENT_AT, images=None
+) -> ChatMessage:
+    return ChatMessage(
+        id=id,
+        sender_name=name,
+        sender_username=username,
+        sender_id=user_id,
+        content=Content(text=text, media=media),
+        date=date,
+        images=list(images or []),
+    )
+
+
+def chat_view(title="测试群", username="testgroup", chat_id=-100, messages=None) -> ChatView:
+    return ChatView(title=title, username=username, chat_id=chat_id, messages=list(messages or []))
+
+
+class FakeFiles:
+    """The bit of a Telethon client that hands over a file's bytes."""
+
+    #: The smallest thing that still looks like a JPEG to a sniffer.
+    JPEG = b"\xff\xd8\xff\xe0" + b"image bytes"
+
+    def __init__(self, content: bytes | None = None) -> None:
+        self.content = self.JPEG if content is None else content
+        self.asked: list[dict] = []
+
+    async def download_media(self, message, file=None, thumb=None):
+        self.asked.append({"message": message, "thumb": thumb})
+        file.write(self.content)
+        return file

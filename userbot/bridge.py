@@ -25,6 +25,11 @@ from dataclasses import dataclass, field
 
 from .content import Content, Quoted
 from .harness import CONNECTION_LOST, TG_DRAFT_TOOL, HarnessError, new_agent_id
+from .history import TOOLS as VIEW_TOOLS
+from .history import current_chat as view_current_chat
+from .history import forward_message as forward_one_message
+from .history import public_chat as view_public_chat
+from .history import read_message as read_one_message
 from .music import LOCAL_TIMEOUT, SEARCH_TOOL, SEND_TOOL, Gate, platform_names, resolve_platform
 from .music import search as search_music
 from .music import send as send_music
@@ -32,6 +37,8 @@ from .parse import TOOL as PARSE_TOOL
 from .parse import send as send_parsed
 from .render import MAX_UNITS, build_reply_parts, clamp_units
 from .status import StatusMessage, TurnStatus
+from .telegram import MAX_IMAGES
+from .tools import chat_argument, message_id_argument, text_argument
 
 log = logging.getLogger(__name__)
 
@@ -39,12 +46,19 @@ TOOL_NAME = TG_DRAFT_TOOL["name"]
 SEARCH_TOOL_NAME = SEARCH_TOOL["name"]
 SEND_TOOL_NAME = SEND_TOOL["name"]
 PARSE_TOOL_NAME = PARSE_TOOL["name"]
+VIEW_CURRENT_TOOL_NAME = VIEW_TOOLS[0]["name"]
+VIEW_PUBLIC_TOOL_NAME = VIEW_TOOLS[1]["name"]
+READ_TOOL_NAME = VIEW_TOOLS[2]["name"]
+FORWARD_TOOL_NAME = VIEW_TOOLS[3]["name"]
+
+# The protocol that carries images on a fork and on a tool result.
+IMAGE_PROTOCOL = 3
 
 # Everything the agent can ask this userbot to do.
-LOCAL_TOOLS = [TG_DRAFT_TOOL, SEARCH_TOOL, SEND_TOOL, PARSE_TOOL]
+LOCAL_TOOLS = [TG_DRAFT_TOOL, SEARCH_TOOL, SEND_TOOL, PARSE_TOOL, *VIEW_TOOLS]
 
 # The tools that declare a rollback: a turn that failed undoes their work.
-UNDOABLE = (TOOL_NAME, SEARCH_TOOL_NAME, SEND_TOOL_NAME, PARSE_TOOL_NAME)
+UNDOABLE = (TOOL_NAME, SEARCH_TOOL_NAME, SEND_TOOL_NAME, PARSE_TOOL_NAME, FORWARD_TOOL_NAME)
 
 
 @dataclass
@@ -54,7 +68,7 @@ class Incoming:
     chat_id: int
     message_id: int
     content: Content
-    sender_id: int
+    sender_id: int | None
     sender_name: str
     sender_username: str | None = None
     chat_title: str | None = None
@@ -63,6 +77,8 @@ class Incoming:
     mentioned: bool = False
     reply_to_message_id: int | None = None
     quoted: Quoted | None = None
+    # The message's pictures, as `data:` URIs, ready to ride along with the fork.
+    images: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -74,11 +90,19 @@ class Identity:
     user_id: int = 0
 
 
-def _who(name: str, username: str | None, user_id: int) -> str:
-    bits = [f"user id {user_id}"]
+def _who(name: str, username: str | None, user_id: int | None) -> str:
+    """`name (@username, user id N)` — the parts Telegram would tell us.
+
+    A message whose sender is hidden — an anonymous admin — has no id and often
+    no username, and is described by whatever is left.
+    """
+    bits = []
     if username:
-        bits.insert(0, f"@{username}")
-    return f"{name or 'unknown'} ({', '.join(bits)})"
+        bits.append(f"@{username}")
+    if user_id:
+        bits.append(f"user id {user_id}")
+    named = name or "unknown"
+    return f"{named} ({', '.join(bits)})" if bits else named
 
 
 def build_prompt(message: Incoming, identity: Identity | None = None) -> str:
@@ -129,18 +153,20 @@ def _music_arguments(arguments: dict, field: str) -> tuple[str, str, str | None]
     platform = resolve_platform(arguments.get("platform"))
     if platform is None:
         return "", "", f"`platform` must be one of {platform_names()}"
-    value = arguments.get(field)
-    if not isinstance(value, str) or not value.strip():
-        return "", "", f"`{field}` must be a non-empty string"
-    return platform, value.strip(), None
+    value, complaint = text_argument(arguments, field)
+    if complaint is not None:
+        return "", "", complaint
+    return platform, value, None
 
 
-def _text_argument(arguments: dict, field: str) -> tuple[str, str | None]:
-    """A required string a tool was given, or what is wrong with it."""
-    value = arguments.get(field)
-    if not isinstance(value, str) or not value.strip():
-        return "", f"`{field}` must be a non-empty string"
-    return value.strip(), None
+def _one_message_arguments(event: dict) -> tuple[int, object | None, str | None]:
+    """The message id and the chat a single-message tool was pointed at."""
+    arguments = event.get("arguments") or {}
+    message_id, complaint = message_id_argument(arguments)
+    if complaint is not None:
+        return 0, None, complaint
+    source, complaint = chat_argument(arguments)
+    return message_id, source, complaint
 
 
 def _failure_reason(event: dict) -> str:
@@ -256,12 +282,18 @@ class Bridge:
             "id": parent,
             "prompt": prompt,
             "new_id": block,
+            # The pictures of what the agent is being asked about — the message
+            # itself and whatever it quotes — so it can look at them.
+            "images": self._images(message),
             # Every fork carries the tools afresh, not just the root: a conversation
             # continuing an older chain still gets the definitions this bot offers
             # today, descriptions included.
             "local_tools": LOCAL_TOOLS,
             "local_timeout": LOCAL_TIMEOUT,
         }
+        if not self._takes_images():
+            # a server that predates them would ignore the field, so do not send it
+            del fields["images"]
         try:
             await self.hh.command(**fields)
             return block
@@ -383,6 +415,14 @@ class Bridge:
             await self._send_music(turn, event, agent_id, call_id)
         elif name == PARSE_TOOL_NAME:
             await self._send_parsed(turn, event, agent_id, call_id)
+        elif name == VIEW_CURRENT_TOOL_NAME:
+            await self._read_current(turn, agent_id, call_id)
+        elif name == VIEW_PUBLIC_TOOL_NAME:
+            await self._read_public(event, agent_id, call_id)
+        elif name == READ_TOOL_NAME:
+            await self._read_one(turn, event, agent_id, call_id)
+        elif name == FORWARD_TOOL_NAME:
+            await self._forward_one(turn, event, agent_id, call_id)
         else:
             await self.hh.resolve_tool(agent_id, call_id, error=f"unknown local tool: {name}")
 
@@ -444,7 +484,7 @@ class Bridge:
             return
         log.info("searching %s on %s for chat %s", keyword, platform, turn.message.chat_id)
         answer = await search_music(self.delivery, keyword, platform, gate=self.music_gate)
-        await self._music_answer(agent_id, call_id, answer)
+        await self._answer(agent_id, call_id, answer)
 
     async def _send_music(self, turn: _Turn, event: dict, agent_id: str, call_id: str) -> None:
         platform, url, complaint = _music_arguments(event.get("arguments") or {}, "url")
@@ -456,17 +496,17 @@ class Bridge:
             self.delivery, url, platform, turn.message.chat_id, gate=self.music_gate
         )
         self._forwarded(turn, call_id, answer)
-        await self._music_answer(agent_id, call_id, answer)
+        await self._answer(agent_id, call_id, answer)
 
     async def _send_parsed(self, turn: _Turn, event: dict, agent_id: str, call_id: str) -> None:
-        url, complaint = _text_argument(event.get("arguments") or {}, "url")
+        url, complaint = text_argument(event.get("arguments") or {}, "url")
         if complaint is not None:
             await self.hh.resolve_tool(agent_id, call_id, error=complaint)
             return
         log.info("parsing %s for chat %s", url, turn.message.chat_id)
         answer = await send_parsed(self.delivery, url, turn.message.chat_id)
         self._forwarded(turn, call_id, answer)
-        await self._music_answer(agent_id, call_id, answer)
+        await self._answer(agent_id, call_id, answer)
 
     def _forwarded(self, turn: _Turn, call_id: str, answer) -> None:
         """A message a tool put into the chat is the userbot's, like any other."""
@@ -476,13 +516,63 @@ class Bridge:
         # replying to what a bot sent continues this very conversation
         self.store.record(turn.message.chat_id, answer.forwarded, turn.block)
 
-    async def _music_answer(self, agent_id: str, call_id: str, answer) -> None:
-        """Tell the model what the bot did, or why it could not be asked."""
+    async def _read_current(self, turn: _Turn, agent_id: str, call_id: str) -> None:
+        """The last messages of the chat this conversation is happening in."""
+        answer = await view_current_chat(self.delivery, turn.message.chat_id)
+        await self._answer(agent_id, call_id, answer)
+
+    async def _read_public(self, event: dict, agent_id: str, call_id: str) -> None:
+        """The last messages of a public chat, named by its username."""
+        username, complaint = text_argument(event.get("arguments") or {}, "username")
+        if complaint is not None:
+            await self.hh.resolve_tool(agent_id, call_id, error=complaint)
+            return
+        answer = await view_public_chat(self.delivery, username)
+        await self._answer(agent_id, call_id, answer)
+
+    async def _read_one(self, turn: _Turn, event: dict, agent_id: str, call_id: str) -> None:
+        """One message, by its id — of this chat or of one the model named."""
+        message_id, source, complaint = _one_message_arguments(event)
+        if complaint is not None:
+            await self.hh.resolve_tool(agent_id, call_id, error=complaint)
+            return
+        answer = await read_one_message(self.delivery, turn.message.chat_id, message_id, source)
+        await self._answer(agent_id, call_id, answer)
+
+    async def _forward_one(self, turn: _Turn, event: dict, agent_id: str, call_id: str) -> None:
+        """One message, put back at the end of this chat."""
+        message_id, source, complaint = _one_message_arguments(event)
+        if complaint is not None:
+            await self.hh.resolve_tool(agent_id, call_id, error=complaint)
+            return
+        answer = await forward_one_message(self.delivery, turn.message.chat_id, message_id, source)
+        self._forwarded(turn, call_id, answer)
+        await self._answer(agent_id, call_id, answer)
+
+    def _takes_images(self) -> bool:
+        """Whether the harness we are talking to knows about images at all."""
+        protocol = (self.hh.hello or {}).get("protocol")
+        return isinstance(protocol, int) and protocol >= IMAGE_PROTOCOL
+
+    def _images(self, message: Incoming) -> list[str]:
+        """The pictures to send with a fork: what this is about, and what it quotes."""
+        images = list(message.images)
+        if message.quoted is not None:
+            images = list(message.quoted.images) + images
+        if len(images) > MAX_IMAGES:
+            log.info("sending only the first %d pictures", MAX_IMAGES)
+            images = images[:MAX_IMAGES]
+        return images
+
+    async def _answer(self, agent_id: str, call_id: str, answer) -> None:
+        """Tell the model what a tool did, or why it could not."""
         if answer.error:
-            log.warning("music call %s failed: %s", call_id, answer.error)
+            log.warning("%s failed: %s", call_id, answer.error)
             await self.hh.resolve_tool(agent_id, call_id, error=answer.error)
         else:
-            await self.hh.resolve_tool(agent_id, call_id, result=answer.result)
+            await self.hh.resolve_tool(
+                agent_id, call_id, result=answer.result, images=answer.images
+            )
 
     async def _rollback(self, turn: _Turn, event: dict) -> None:
         """The harness is undoing the turn — take what it sent back with it."""

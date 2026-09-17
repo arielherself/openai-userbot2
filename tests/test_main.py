@@ -5,10 +5,13 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timedelta, timezone
 
+from support import FakeFiles
 from telethon.tl import types
 from telethon.tl.custom import Message as TgMessage
 
-from userbot.main import incoming_from, mentions_us, quoted_from
+from userbot.bridge import build_prompt
+from userbot.main import incoming_from, mentions_us, quoted_from, sender_of
+from userbot.telegram import Sender, images_of
 
 ME = types.User(id=4242, first_name="小助手", username="MyBot", access_hash=1)
 
@@ -40,15 +43,23 @@ def photo(width=1280, height=720):
     )
 
 
-def tg_message(id=999, text="", peer=9, out=False, reply_to=None, sender=None):
-    """A Telethon message, as `get_reply_message` would hand one over."""
+def tg_message(
+    id=999, text="", peer=9, out=False, reply_to=None, sender=None, media=None, post_author=None
+):
+    """A Telethon message, as `get_reply_message` would hand one over.
+
+    `peer=None` builds one with no sender at all, the way a post whose author
+    Telegram hides arrives.
+    """
     message = TgMessage(
         id=id,
-        peer_id=types.PeerUser(user_id=peer),
+        peer_id=types.PeerUser(user_id=peer) if peer else None,
         date=datetime.now(timezone.utc),
         message=text,
         out=out,
         reply_to=reply_to,
+        media=media,
+        post_author=post_author,
     )
     message._sender = sender  # what the entity cache would have filled in
     return message
@@ -68,6 +79,7 @@ class FakeMessage:
         reply=None,
         sender=None,
         entities=(),
+        post_author=None,
     ) -> None:
         self.id = id
         self.message = text
@@ -78,7 +90,8 @@ class FakeMessage:
         self.media = media
         self.web_preview = webpage
         self.reply_to = reply_to
-        self.sender = sender
+        self.post_author = post_author
+        self.sender = sender if sender is not None else person()
         self._reply = reply
         self._entities = list(entities)
 
@@ -99,11 +112,12 @@ class FakeMessage:
 
 
 class FakeEvent:
-    def __init__(self, message, chat=None, sender=None, is_group=True) -> None:
+    def __init__(self, message, chat=None, sender=None, is_group=True, client=None) -> None:
         self.message = message
         self.chat = chat if chat is not None else group()
         self.sender = sender if sender is not None else person()
         self.is_group = is_group
+        self.client = client if client is not None else FakeFiles()
 
     async def get_chat(self):
         return self.chat
@@ -235,5 +249,90 @@ def test_a_quoted_selection_comes_along():
 def test_a_story_reply_is_not_a_message_reply():
     header = types.MessageReplyStoryHeader(peer=types.PeerUser(user_id=9), story_id=5)
     message = FakeMessage(text="看了你的故事", reply_to=header)
-    assert asyncio.run(quoted_from(message, ME)) is None
+    assert asyncio.run(quoted_from(message, ME, None)) is None
     assert build(FakeEvent(message)).reply_to_message_id is None
+
+
+def test_a_picture_in_the_message_and_in_the_quote_comes_along():
+    photo = types.MessageMediaPhoto(
+        photo=types.Photo(
+            id=1,
+            access_hash=1,
+            file_reference=b"",
+            date=None,
+            dc_id=2,
+            sizes=[types.PhotoSize(type="x", w=800, h=600, size=10)],
+        )
+    )
+    header = types.MessageReplyHeader(
+        reply_to_msg_id=999, reply_to_peer_id=types.PeerUser(user_id=9)
+    )
+    reply = tg_message(id=999, text="看这个", media=photo, sender=person(id=9, name="小红"))
+
+    incoming = build(
+        FakeEvent(FakeMessage(text="这是什么？", media=photo, reply_to=header, reply=reply))
+    )
+    assert incoming.images[0].startswith("data:image/jpeg;base64,")
+    assert incoming.quoted.images == incoming.images  # the same picture, twice asked for
+
+
+def test_a_message_without_a_picture_carries_none():
+    incoming = build(FakeEvent(FakeMessage(text="就一句话")))
+    assert incoming.images == []
+    assert incoming.quoted is None
+
+
+def test_a_hidden_sender_is_described_by_what_is_left():
+    silent = tg_message(id=7, text="匿名发帖", peer=None)
+    assert asyncio.run(sender_of(silent)) == Sender("anonymous admin")
+
+    signed = tg_message(id=8, text="署名发帖", peer=None, post_author="Channel")
+    assert asyncio.run(sender_of(signed)) == Sender("Channel")
+
+
+def test_an_anonymous_post_carries_no_id_into_the_prompt():
+    message = FakeMessage(text="@MyBot 看一下", sender_id=None, post_author="Channel")
+    message.sender = None
+    incoming = build(FakeEvent(message, sender=None))
+
+    assert incoming.sender_name == "Channel"
+    assert incoming.sender_id is None
+    assert "from: Channel\n" in build_prompt(incoming)  # no "user id 0"
+
+
+def picture():
+    return types.MessageMediaPhoto(
+        photo=types.Photo(
+            id=1,
+            access_hash=1,
+            file_reference=b"",
+            date=None,
+            dc_id=2,
+            sizes=[
+                types.PhotoStrippedSize(type="i", bytes=b"tiny"),
+                types.PhotoSize(type="m", w=320, h=240, size=10),
+                types.PhotoSize(type="x", w=800, h=600, size=20),
+            ],
+        )
+    )
+
+
+def test_a_hidden_sender_picture_downloads_like_any_other():
+    """Who sent it says nothing about the file: the media is its own."""
+    hidden = tg_message(id=9, text="看这个", peer=None, media=picture())
+    files = FakeFiles()
+
+    assert asyncio.run(sender_of(hidden)) == Sender("anonymous admin")
+    images = asyncio.run(images_of(files, hidden))
+    assert images[0].startswith("data:image/jpeg;base64,")
+    # the same readable size a named sender's photo would get, past the stripped one
+    assert files.asked == [{"message": hidden, "thumb": 2}]
+
+
+def test_an_anonymous_post_with_a_picture_reaches_the_agent():
+    message = FakeMessage(text="@MyBot 看看", sender_id=None, media=picture())
+    message.sender = None
+    incoming = build(FakeEvent(message, sender=None, client=FakeFiles()))
+
+    assert incoming.sender_name == "anonymous admin" and incoming.sender_id is None
+    assert incoming.images and incoming.images[0].startswith("data:image/jpeg;base64,")

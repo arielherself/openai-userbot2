@@ -9,18 +9,31 @@ Telegram account.
 from __future__ import annotations
 
 import asyncio
+import base64
+import io
 import re
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Protocol
 
-from telethon import events
+from telethon import events, utils
 from telethon.extensions import markdown
 from telethon.tl import types
 from telethon.tl.custom import Message as TelegramMessage
 
+from .content import Content, content_of
+
 # Where a message goes: an id, or a username like the music bot's.
 Entity = int | str
+
+# How much image to hand over. It rides in the same single JSON line as everything
+# else, base64 makes it a third bigger again, and the harness stops at 8 MiB.
+MAX_IMAGE_BYTES = 3 * 1024 * 1024
+MAX_IMAGES_BYTES = 5 * 1024 * 1024
+MAX_IMAGES = 4
+# Photos come in several sizes; wide enough to read, narrow enough to be small.
+USEFUL_WIDTH = 1280
 
 
 @dataclass
@@ -40,6 +53,40 @@ class BotMessage:
     has_link: bool = False
     has_buttons: bool = False
     has_music: bool = False
+
+
+@dataclass
+class Sender:
+    """Who sent a message, as far as Telegram will say."""
+
+    name: str
+    username: str | None = None
+    #: None when Telegram hides the sender — an anonymous admin, say.
+    user_id: int | None = None
+
+
+@dataclass
+class ChatMessage:
+    """One message of a chat's history, as a tool sees it."""
+
+    id: int
+    sender_name: str
+    sender_username: str | None
+    sender_id: int | None
+    content: Content
+    date: datetime | None = None
+    # The message's images as `data:` URIs, when they were asked for.
+    images: list[str] = field(default_factory=list)
+
+
+@dataclass
+class ChatView:
+    """A chat and the messages that were read from it."""
+
+    title: str
+    username: str | None
+    chat_id: int
+    messages: list[ChatMessage]
 
 
 class Listener(Protocol):
@@ -81,6 +128,17 @@ class Delivery(Protocol):
 
     async def forward(self, chat_id: Entity, message_id: int, to_chat_id: Entity) -> int:
         """Forward a message into another chat and return the new message's id."""
+
+    async def recent_messages(self, chat_id: Entity, limit: int = 50) -> ChatView:
+        """A chat and its last `limit` messages, oldest first."""
+
+    async def message(
+        self, chat_id: Entity, message_id: int, images: bool = False
+    ) -> ChatMessage | None:
+        """One message of a chat, or None when there is no such message.
+
+        `images` asks for its pictures to be fetched and carried along too.
+        """
 
 
 class _TelethonListener:
@@ -191,3 +249,118 @@ class TelethonDelivery:
     async def forward(self, chat_id, message_id, to_chat_id) -> int:
         forwarded = await self.client.forward_messages(to_chat_id, message_id, chat_id)
         return forwarded.id
+
+    async def recent_messages(self, chat_id, limit=50) -> ChatView:
+        entity = await self.client.get_entity(chat_id)
+        messages = await self.client.get_messages(entity, limit=limit)
+        read = [
+            await chat_message(message)
+            for message in messages
+            if isinstance(message, TelegramMessage)
+        ]
+        read.reverse()  # Telegram hands them over newest first
+        return ChatView(
+            title=utils.get_display_name(entity) or "unnamed",
+            username=getattr(entity, "username", None),
+            chat_id=utils.get_peer_id(entity),
+            messages=read,
+        )
+
+    async def message(self, chat_id, message_id, images=False) -> ChatMessage | None:
+        found = await self.client.get_messages(chat_id, ids=message_id)
+        if not isinstance(found, TelegramMessage):
+            return None
+        read = await chat_message(found)
+        if images:
+            read.images = await images_of(self.client, found)
+        return read
+
+
+async def images_of(client, message, budget: int = MAX_IMAGES_BYTES) -> list[str]:
+    """A message's pictures, as `data:` URIs — at most a few, and none oversized.
+
+    A photo is its own picture; a document is one when it is an image, and
+    otherwise contributes its thumbnail, which is how a video, a video note, an
+    animation or a video sticker gives up a frame. Anything else has no picture,
+    and nothing here is worth failing a turn over: a download that goes wrong
+    simply leaves a placeholder in the prompt.
+    """
+    kind, thumb, mime = image_source(message)
+    if kind == "none":
+        return []
+    try:
+        handle = await client.download_media(
+            message, file=io.BytesIO(), thumb=thumb if kind == "thumb" else None
+        )
+    except Exception:
+        return []
+    raw = handle.getvalue() if handle is not None else b""
+    if not raw or len(raw) > MAX_IMAGE_BYTES:
+        return []
+    encoded = base64.b64encode(raw).decode("ascii")
+    if len(encoded) > budget:
+        return []
+    return [f"data:{mime};base64,{encoded}"]
+
+
+def image_source(message) -> tuple[str, int | None, str]:
+    """What picture a message holds: `("file"|"thumb"|"none", size index, mime)`."""
+    media = getattr(message, "media", None)
+    if isinstance(media, types.MessageMediaPhoto):
+        if media.photo is None:
+            return "none", None, ""
+        return "thumb", best_size(getattr(media.photo, "sizes", None)), "image/jpeg"
+    if not isinstance(media, types.MessageMediaDocument) or media.document is None:
+        return "none", None, ""
+    document = media.document
+    mime = document.mime_type or ""
+    if mime.startswith("image/"):
+        return "file", None, mime
+    thumb = best_size(document.thumbs)
+    if thumb is None:
+        return "none", None, ""
+    return "thumb", thumb, "image/jpeg"
+
+
+def best_size(sizes) -> int | None:
+    """Which of a media's sizes to fetch: the widest usable one, never the raw file."""
+    usable = [
+        (index, size)
+        for index, size in enumerate(sizes or [])
+        if isinstance(size, (types.PhotoSize, types.PhotoSizeProgressive, types.PhotoCachedSize))
+    ]
+    if not usable:
+        return None
+    modest = [pair for pair in usable if pair[1].w <= USEFUL_WIDTH] or usable
+    return max(modest, key=lambda pair: pair[1].w * pair[1].h)[0]
+
+
+async def sender_of(message) -> Sender:
+    """Who sent a message — or, when Telegram hides it, as much as it will say.
+
+    A post by an anonymous admin has no sender id at all: the message is the
+    group's, and all that may be left is a signature (`post_author`).
+    """
+    sender = await message.get_sender()
+    identifier = message.sender_id
+    if identifier:
+        return Sender(
+            utils.get_display_name(sender) or "unknown",
+            getattr(sender, "username", None),
+            identifier,
+        )
+    signature = (getattr(message, "post_author", None) or "").strip()
+    return Sender(signature or "anonymous admin")
+
+
+async def chat_message(message) -> ChatMessage:
+    """One message of a history, with its sender resolved."""
+    sender = await sender_of(message)
+    return ChatMessage(
+        id=message.id,
+        sender_name=sender.name,
+        sender_username=sender.username,
+        sender_id=sender.user_id,
+        content=content_of(message),
+        date=message.date,
+    )

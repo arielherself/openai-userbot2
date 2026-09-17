@@ -114,3 +114,17 @@ def test_an_overlong_summary_is_cut_marked():
     text = clamp_units("字" * 5000, 100)
     assert text_units(text) <= 100
     assert text.endswith("…")
+
+
+def test_nobody_gets_mentioned_by_a_draft():
+    """An `@name` in a reply would notify whoever it names, so it is shown as `#`."""
+    parts = build_reply_parts("回复 @小明", "可以问 **@channel**，或者写邮件给 a@b.com")
+    assert parts[0].text == "回复 #小明\n\n可以问 #channel，或者写邮件给 a#b.com"
+    # one character for one: the bold run is still where it was
+    assert bold_of(parts[0]) == ["#channel"]
+
+
+def test_the_replacement_does_not_move_the_entities():
+    parts = build_reply_parts("", "@" * 50 + " **粗体**")
+    assert parts[0].text.startswith("#" * 50)
+    assert bold_of(parts[0]) == ["粗体"]

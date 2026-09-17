@@ -10,20 +10,8 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from dataclasses import dataclass
 
 from .telegram import BotMessage, Delivery, Listener
-
-
-@dataclass
-class Answer:
-    """What such a tool tells the model: a result, or why there is none."""
-
-    result: str = ""
-    error: str = ""
-    # What a rollback would have to delete: what the tool put into the chat.
-    forwarded: int | None = None
-
 
 # Given a message and the id of the command we sent, is this the answer?
 Accept = Callable[[BotMessage, int], bool]

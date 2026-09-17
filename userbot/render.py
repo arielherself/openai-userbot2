@@ -145,9 +145,14 @@ def build_reply_parts(
     limit: int = MAX_UNITS,
     max_parts: int = MAX_PARTS,
 ) -> list[Part]:
-    """The Telegram messages for one draft: summary first, then the blockquoted rest."""
-    summary = (summary or "").strip()
-    details = (details or "").strip()
+    """The Telegram messages for one draft: summary first, then the blockquoted rest.
+
+    Telegram reads an `@name` as a mention, which notifies whoever it names, so a
+    draft is published with every `@` shown as `#` — one character for one, which
+    leaves the entities where they were.
+    """
+    summary = (summary or "").strip().replace("@", "#")
+    details = (details or "").strip().replace("@", "#")
     plain, spans = parse_bold(details)
 
     if summary:
