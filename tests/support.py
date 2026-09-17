@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 
+from userbot.telegram import BotMessage
+
 DEFAULTS = {"endpoint": "https://provider.invalid/v1", "model": "fake-model", "has_key": True}
 
 
@@ -106,8 +108,16 @@ class FakeTelegram:
         self.sent: list[dict] = []
         self.edits: list[dict] = []
         self.deleted: list[tuple[int, tuple[int, ...]]] = []
+        self.forwarded: list[dict] = []
         self.fail_send = False
+        self.fail_forward = False
+        # What the "other side" sends back: a chat the tools listen to gets these.
+        self.inbox: list[BotMessage] = []
+        # Called with (chat_id, text) after a send, so a test can script the reply
+        # the way a real bot would produce it.
+        self.on_send = None
         self._next_id = 1000
+        self._listeners: list[tuple] = []
 
     async def send(self, chat_id, text, entities=None, reply_to=None) -> int:
         if self.fail_send:
@@ -122,6 +132,8 @@ class FakeTelegram:
                 "reply_to": reply_to,
             }
         )
+        if self.on_send is not None:
+            self.on_send(chat_id, text)
         return self._next_id
 
     async def edit(self, chat_id, message_id, text) -> None:
@@ -129,6 +141,21 @@ class FakeTelegram:
 
     async def delete(self, chat_id, message_ids) -> None:
         self.deleted.append((chat_id, tuple(message_ids)))
+
+    def listen(self, chat_id) -> _FakeListener:
+        # Like the real one: watching starts before the command goes out, and it
+        # hands over everything the chat says from then on.
+        self._listeners.append(chat_id)
+        return _FakeListener(self, chat_id)
+
+    async def forward(self, chat_id, message_id, to_chat_id) -> int:
+        if self.fail_forward:
+            raise RuntimeError("telegram said no")
+        self._next_id += 1
+        self.forwarded.append(
+            {"id": self._next_id, "from": chat_id, "message_id": message_id, "to": to_chat_id}
+        )
+        return self._next_id
 
     # --- questions the tests ask --------------------------------------------
     def live(self) -> list[dict]:
@@ -138,6 +165,47 @@ class FakeTelegram:
 
     def of(self, message_id: int) -> dict:
         return next(message for message in self.sent if message["id"] == message_id)
+
+
+class _FakeListener:
+    """The fake's `listen`: the chat's messages, oldest first."""
+
+    def __init__(self, delivery, chat_id) -> None:
+        self.delivery = delivery
+        self.chat_id = chat_id
+        self.closed = False
+
+    async def next(self, timeout: float):
+        for index, message in enumerate(self.delivery.inbox):
+            if message.chat_id == self.chat_id:
+                del self.delivery.inbox[index]
+                return message
+        return None
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def bot_message(
+    id=1,
+    chat_id=-500,
+    text="",
+    markdown="",
+    reply_to=None,
+    has_link=False,
+    has_buttons=False,
+    has_music=False,
+) -> BotMessage:
+    return BotMessage(
+        id=id,
+        chat_id=chat_id,
+        text=text,
+        markdown=markdown or text,  # what a bot writes is markdown; plain is the fallback
+        reply_to=reply_to,
+        has_link=has_link,
+        has_buttons=has_buttons,
+        has_music=has_music,
+    )
 
 
 def text_of(sent) -> str:

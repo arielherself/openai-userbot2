@@ -64,6 +64,55 @@ well: the two are one reply, not a teaser and an appendix. A link is written as
 the bare URL with a space on each side of it — never `[text](url)` — so it is not
 glued to the words around it.
 
+### Music
+
+Two more tools talk to a third-party music bot, [@Music163DownBot](https://t.me/Music163DownBot):
+
+| tool | what happens |
+|---|---|
+| `tg_search_music(keyword, platform)` | the bot is sent `/search <keyword> <code>` and its listing comes back as the tool result — a numbered song per line, each with its link, **as the bot wrote it**: Telegram turns a bot's Markdown into message entities, so the text is re-rendered with its links (`[title](link)`) rather than handed over with them stripped. An edit that adds the keyboard counts as the answer too, which is how that bot delivers it. |
+| `tg_send_music(url, platform)` | the bot is sent `/music <url> <code>`, and the audio file it returns is **forwarded into the chat**; a refusal comes back as the tool result instead |
+
+### Parsed content
+
+| tool | what happens |
+|---|---|
+| `tg_send_parsed_content(url)` | the link is sent to [@ParseHubot](https://t.me/ParseHubot), which answers that very message with the page or video rendered; that answer is **forwarded into the chat** |
+
+It covers 酷安, 贴吧, 豆瓣, 知乎, 皮皮虾, 最右, 抖音, 快手, 微博, 微信公众号, 小黑盒,
+小红书, Youtube, Twitter, TikTok, Threads, Snapchat, Instagram, Facebook and
+Bilibili. The answer counts only when it *is* a reply to the link and carries a
+link of its own (a bare URL, or one hidden in formatted link text) — a note like
+"解析中…" is not the content yet. The bot has 15 seconds to acknowledge the link
+at all; after that the call may take up to 5 minutes, and a bot that stays silent
+returns an error. The forwarded content is recorded like the reply's messages, so
+replying to it continues the conversation, and a failed turn deletes it again.
+
+`platform` is one of `NetEase`, `AppleMusic`, `QQMusic`, `Soda`, mapped to the
+bot's own names (`163`, `am`, `qq`, `qs`). The agent is told to try them in that
+order, falling back to the next one when a search comes up empty — and to pass the
+platform the link actually came from to `tg_send_music`.
+
+The music bot is shared, so the whole userbot makes **one music call at a time**
+and waits **5 seconds after each call ends** before the next one starts — across
+all chats, not per conversation. A `tg_search_music` or `tg_send_music` call has a
+budget of **5 minutes that covers everything**: waiting for its turn at that rate
+limit, the bot's grace period, and the answer. A call that would spend its budget
+just queueing returns `the music bot is busy: …` instead of waiting in line.
+
+Once a call has its turn, a working bot acknowledges the command almost
+immediately, so **30 seconds of complete silence** counts as unreachable; after
+that it may take the rest of the budget to produce the listing or the file. A
+conversation's root is created with a `local_timeout` of 15 minutes so the harness
+outlives a queue plus a slow fetch.
+
+Every failure on our side — the bot cannot be reached, it never answers, the file
+cannot be forwarded — comes back to the agent as a **tool error**, so it can fall
+back to the next platform or tell the user what happened. A refusal from the bot
+("fail: …") is not an error: it is the tool's result, passed on verbatim.
+`tg_send_music` declares a rollback, so a turn that fails after the file went out
+deletes it again — and drops its mapping, like the reply's.
+
 The details are wrapped in a **collapsed blockquote**. Telegram caps a message at
 4096 characters, so a long `details` becomes several messages — each keeping its
 own collapsed blockquote, the first one replying to the user and the rest following
@@ -165,10 +214,11 @@ uv run python -m userbot --harness-port 8765 --db userbot.db
 
 Answers have to be continuable, so every message the userbot sends is recorded
 against the block that produced it — `(chat_id, message_id) → agent_id`, plus one
-root block per chat. Two kinds of message are recorded:
+root block per chat. Three kinds of message are recorded:
 
 1. every message of a delivered `tg_draft_response`;
-2. the failure notice, when a turn fails after the block existed.
+2. every track `tg_send_music` forwards into the chat;
+3. the failure notice, when a turn fails after the block existed.
 
 Nothing else is: a reply to the status message, or to anything sent before the
 mapping was kept, is ignored on purpose.
@@ -188,9 +238,10 @@ auto-vacuum hands them back, so the file stays near the budget.
 - Messages that arrived while the userbot was offline are ignored.
 - Replying to somebody else's message is quoted into the prompt; replying to the
   userbot's own message continues that conversation instead of quoting it back.
-- A `tg_draft_response` call is declared with `rollback`, so a turn that fails
-  after the reply was delivered takes the messages back down and drops their
-  mappings — the failure notice then explains what happened.
+- The local tools that post something — `tg_draft_response`, `tg_send_music`,
+  `tg_send_parsed_content` — declare a rollback, so a turn that fails after they
+  did takes the messages back down (and drops their mappings) before the failure
+  notice explains what happened.
 - If the harness has forgotten the block a reply points at (eviction, or another
   database), the conversation restarts from a fresh root instead of staying silent.
 
@@ -212,6 +263,9 @@ lands on the block that answered. It is skipped when no checkout is present.
 userbot/store.py     message -> agent block mappings, with the size budget
 userbot/render.py    the draft: bold-only markdown, collapsed quote, splitting
 userbot/content.py   what a message carries: text, media placeholders, Instant Views
+userbot/music.py     the two tools that reach the music bot
+userbot/parse.py     the tool that has the parse bot render a link
+userbot/relay.py     the shape both share: ask a bot, wait for its answer
 userbot/harness.py   the harness wire protocol, one connection, many conversations
 userbot/status.py    the single status message, and its rate limit
 userbot/bridge.py    the rules: what is answered, where the turn forks, what is sent

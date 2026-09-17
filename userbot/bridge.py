@@ -25,12 +25,26 @@ from dataclasses import dataclass, field
 
 from .content import Content, Quoted
 from .harness import CONNECTION_LOST, TG_DRAFT_TOOL, HarnessError, new_agent_id
+from .music import LOCAL_TIMEOUT, SEARCH_TOOL, SEND_TOOL, Gate, platform_names, resolve_platform
+from .music import search as search_music
+from .music import send as send_music
+from .parse import TOOL as PARSE_TOOL
+from .parse import send as send_parsed
 from .render import MAX_UNITS, build_reply_parts, clamp_units
 from .status import StatusMessage, TurnStatus
 
 log = logging.getLogger(__name__)
 
 TOOL_NAME = TG_DRAFT_TOOL["name"]
+SEARCH_TOOL_NAME = SEARCH_TOOL["name"]
+SEND_TOOL_NAME = SEND_TOOL["name"]
+PARSE_TOOL_NAME = PARSE_TOOL["name"]
+
+# Everything the agent can ask this userbot to do.
+LOCAL_TOOLS = [TG_DRAFT_TOOL, SEARCH_TOOL, SEND_TOOL, PARSE_TOOL]
+
+# The tools that declare a rollback: a turn that failed undoes their work.
+UNDOABLE = (TOOL_NAME, SEARCH_TOOL_NAME, SEND_TOOL_NAME, PARSE_TOOL_NAME)
 
 
 @dataclass
@@ -110,6 +124,25 @@ def _short(text, limit: int = 200) -> str:
     return flat if len(flat) <= limit else flat[: limit - 1] + "…"
 
 
+def _music_arguments(arguments: dict, field: str) -> tuple[str, str, str | None]:
+    """The platform and the text a music tool was given, or what is wrong with them."""
+    platform = resolve_platform(arguments.get("platform"))
+    if platform is None:
+        return "", "", f"`platform` must be one of {platform_names()}"
+    value = arguments.get(field)
+    if not isinstance(value, str) or not value.strip():
+        return "", "", f"`{field}` must be a non-empty string"
+    return platform, value.strip(), None
+
+
+def _text_argument(arguments: dict, field: str) -> tuple[str, str | None]:
+    """A required string a tool was given, or what is wrong with it."""
+    value = arguments.get(field)
+    if not isinstance(value, str) or not value.strip():
+        return "", f"`{field}` must be a non-empty string"
+    return value.strip(), None
+
+
 def _failure_reason(event: dict) -> str:
     kind, error = event.get("error_type"), event.get("error")
     for candidate in (error, kind):
@@ -128,6 +161,9 @@ class _Turn:
     tracker: StatusMessage
     sent: list[int] = field(default_factory=list)
     delivered: bool = False
+    # What a rollback would have to delete, per local call: the messages a call
+    # put into the chat, keyed by that call's id.
+    effects: dict[str, list[int]] = field(default_factory=dict)
 
 
 class Bridge:
@@ -140,6 +176,7 @@ class Bridge:
         turn_timeout: float = 3600.0,
         model: str | None = None,
         identity: Identity | None = None,
+        music_gate: Gate | None = None,
     ) -> None:
         self.hh = harness
         self.store = store
@@ -148,6 +185,8 @@ class Bridge:
         self.turn_timeout = turn_timeout
         self.model = model
         self.identity = identity
+        # one gate for the whole userbot: the music bot is shared between chats
+        self.music_gate = music_gate if music_gate is not None else Gate()
 
     # --- entry point --------------------------------------------------------
     async def handle(self, message: Incoming) -> None:
@@ -194,7 +233,14 @@ class Bridge:
         if root is not None:
             return root
         root = new_agent_id("root")
-        fields = {"command": "create_agent", "id": root, "local_tools": [TG_DRAFT_TOOL]}
+        fields = {
+            "command": "create_agent",
+            "id": root,
+            "local_tools": LOCAL_TOOLS,
+            # A local tool may have to wait on the music bot, so the harness has to
+            # be willing to wait at least as long for our answer.
+            "local_timeout": LOCAL_TIMEOUT,
+        }
         if self.model:
             fields["model"] = self.model
         await self.hh.command(**fields)
@@ -205,8 +251,19 @@ class Bridge:
     async def _fork(self, message: Incoming, parent: str) -> str:
         block = new_agent_id("tg")
         prompt = build_prompt(message, self.identity)
+        fields = {
+            "command": "fork",
+            "id": parent,
+            "prompt": prompt,
+            "new_id": block,
+            # Every fork carries the tools afresh, not just the root: a conversation
+            # continuing an older chain still gets the definitions this bot offers
+            # today, descriptions included.
+            "local_tools": LOCAL_TOOLS,
+            "local_timeout": LOCAL_TIMEOUT,
+        }
         try:
-            await self.hh.command(command="fork", id=parent, prompt=prompt, new_id=block)
+            await self.hh.command(**fields)
             return block
         except HarnessError as error:
             if error.code != "unknown_agent":
@@ -215,8 +272,8 @@ class Bridge:
             # database. The conversation cannot be continued, so start a fresh one
             # rather than leave the message unanswered.
             log.warning("the harness no longer knows %s; opening a new conversation", parent)
-            parent = await self._chat_root(message.chat_id, refresh=True)
-            await self.hh.command(command="fork", id=parent, prompt=prompt, new_id=block)
+            fields["id"] = await self._chat_root(message.chat_id, refresh=True)
+            await self.hh.command(**fields)
             return block
 
     # --- running the turn ----------------------------------------------------
@@ -311,16 +368,25 @@ class Bridge:
         if failure is not None:
             await self._failure(message, block, failure)
 
-    # --- the local tool ------------------------------------------------------
+    # --- the local tools -----------------------------------------------------
     async def _local_call(self, turn: _Turn, event: dict) -> None:
         """A parked local tool call — this one is ours to run."""
         agent_id = event.get("agent_id") or turn.block
         call_id = event.get("call_id")
         name = event.get("name")
 
-        if name != TOOL_NAME:
+        if name == TOOL_NAME:
+            await self._draft(turn, event, agent_id, call_id)
+        elif name == SEARCH_TOOL_NAME:
+            await self._search_music(turn, event, agent_id, call_id)
+        elif name == SEND_TOOL_NAME:
+            await self._send_music(turn, event, agent_id, call_id)
+        elif name == PARSE_TOOL_NAME:
+            await self._send_parsed(turn, event, agent_id, call_id)
+        else:
             await self.hh.resolve_tool(agent_id, call_id, error=f"unknown local tool: {name}")
-            return
+
+    async def _draft(self, turn: _Turn, event: dict, agent_id: str, call_id: str) -> None:
         if turn.delivered:
             await self.hh.resolve_tool(
                 agent_id,
@@ -353,6 +419,7 @@ class Bridge:
         except Exception as error:
             log.warning("Telegram refused the reply for %s: %s", turn.message.message_id, error)
             self._remember(turn)
+            turn.effects[call_id] = list(turn.sent)
             await self.hh.resolve_tool(
                 agent_id, call_id, error=f"Telegram refused the messages: {error}"
             )
@@ -360,6 +427,7 @@ class Bridge:
 
         self._remember(turn)
         turn.delivered = True
+        turn.effects[call_id] = list(turn.sent)
         tool = turn.status.tool(TOOL_NAME)
         tool.state, tool.detail = "ok", f"{len(turn.sent)} sent"
         await turn.tracker.delete()
@@ -369,28 +437,78 @@ class Bridge:
             result=f"delivered: the reply went out as {len(turn.sent)} Telegram message(s)",
         )
 
+    async def _search_music(self, turn: _Turn, event: dict, agent_id: str, call_id: str) -> None:
+        platform, keyword, complaint = _music_arguments(event.get("arguments") or {}, "keyword")
+        if complaint is not None:
+            await self.hh.resolve_tool(agent_id, call_id, error=complaint)
+            return
+        log.info("searching %s on %s for chat %s", keyword, platform, turn.message.chat_id)
+        answer = await search_music(self.delivery, keyword, platform, gate=self.music_gate)
+        await self._music_answer(agent_id, call_id, answer)
+
+    async def _send_music(self, turn: _Turn, event: dict, agent_id: str, call_id: str) -> None:
+        platform, url, complaint = _music_arguments(event.get("arguments") or {}, "url")
+        if complaint is not None:
+            await self.hh.resolve_tool(agent_id, call_id, error=complaint)
+            return
+        log.info("sending %s (%s) to chat %s", url, platform, turn.message.chat_id)
+        answer = await send_music(
+            self.delivery, url, platform, turn.message.chat_id, gate=self.music_gate
+        )
+        self._forwarded(turn, call_id, answer)
+        await self._music_answer(agent_id, call_id, answer)
+
+    async def _send_parsed(self, turn: _Turn, event: dict, agent_id: str, call_id: str) -> None:
+        url, complaint = _text_argument(event.get("arguments") or {}, "url")
+        if complaint is not None:
+            await self.hh.resolve_tool(agent_id, call_id, error=complaint)
+            return
+        log.info("parsing %s for chat %s", url, turn.message.chat_id)
+        answer = await send_parsed(self.delivery, url, turn.message.chat_id)
+        self._forwarded(turn, call_id, answer)
+        await self._music_answer(agent_id, call_id, answer)
+
+    def _forwarded(self, turn: _Turn, call_id: str, answer) -> None:
+        """A message a tool put into the chat is the userbot's, like any other."""
+        if answer.forwarded is None:
+            return
+        turn.effects[call_id] = [answer.forwarded]
+        # replying to what a bot sent continues this very conversation
+        self.store.record(turn.message.chat_id, answer.forwarded, turn.block)
+
+    async def _music_answer(self, agent_id: str, call_id: str, answer) -> None:
+        """Tell the model what the bot did, or why it could not be asked."""
+        if answer.error:
+            log.warning("music call %s failed: %s", call_id, answer.error)
+            await self.hh.resolve_tool(agent_id, call_id, error=answer.error)
+        else:
+            await self.hh.resolve_tool(agent_id, call_id, result=answer.result)
+
     async def _rollback(self, turn: _Turn, event: dict) -> None:
-        """The harness is undoing the turn — take the reply back with it."""
+        """The harness is undoing the turn — take what it sent back with it."""
         agent_id = event.get("agent_id") or turn.block
         call_id = event.get("call_id")
         name = event.get("name")
+        original = event.get("rollback_of") or call_id
 
-        if name != TOOL_NAME:
+        if name not in UNDOABLE:
             await self.hh.resolve_tool(agent_id, call_id, error=f"nothing to undo for {name}")
             return
-        if not turn.sent:
-            await self.hh.resolve_tool(agent_id, call_id, result="no reply had been sent")
+        messages = turn.effects.pop(original, [])
+        if name == TOOL_NAME:
+            turn.delivered = False
+            turn.sent = []
+        if not messages:
+            await self.hh.resolve_tool(agent_id, call_id, result="nothing to undo")
             return
-        sent, turn.sent = turn.sent, []
-        turn.delivered = False
         try:
-            await self.delivery.delete(turn.message.chat_id, sent)
+            await self.delivery.delete(turn.message.chat_id, messages)
         except Exception as error:
-            log.warning("could not delete the rolled-back reply: %s", error)
+            log.warning("could not delete the rolled-back messages: %s", error)
             await self.hh.resolve_tool(agent_id, call_id, error=f"could not delete: {error}")
             return
-        self.store.forget(turn.message.chat_id, sent)
-        await self.hh.resolve_tool(agent_id, call_id, result=f"deleted {len(sent)} message(s)")
+        self.store.forget(turn.message.chat_id, messages)
+        await self.hh.resolve_tool(agent_id, call_id, result=f"deleted {len(messages)} message(s)")
 
     # --- messages of our own -------------------------------------------------
     def _remember(self, turn: _Turn) -> None:

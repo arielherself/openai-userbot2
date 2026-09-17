@@ -133,3 +133,12 @@ def test_a_chat_that_refuses_the_status_does_not_stop_the_turn():
         assert delivery.sent == []
 
     asyncio.run(scenario())
+
+
+def test_a_long_tool_error_is_kept_short():
+    status = TurnStatus(phase="thinking")
+    status.tool("tg_search_music").state = "failed"
+    status.tool("tg_search_music").detail = "could not reach the music bot: " + "x" * 200
+    line = next(line for line in status.render().splitlines() if "tg_search_music" in line)
+    assert line.startswith("❌ tg_search_music failed (could not reach the music bot: ")
+    assert "…" in line and len(line) < 120

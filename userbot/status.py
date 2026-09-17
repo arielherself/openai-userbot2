@@ -48,7 +48,10 @@ def tool_line(tool: ToolProgress) -> str:
         return f"🔧 calling {tool.name}"
     if tool.state == "ok":
         return f"✅ {tool.name}"
-    return f"❌ {tool.name} failed" + (f" ({tool.detail})" if tool.detail else "")
+    error = " ".join((tool.detail or "").split())
+    if len(error) > 80:
+        error = error[:79] + "…"
+    return f"❌ {tool.name} failed" + (f" ({error})" if error else "")
 
 
 @dataclass

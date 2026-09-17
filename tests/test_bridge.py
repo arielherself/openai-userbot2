@@ -3,17 +3,27 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
-from support import FakeHarness, FakeTelegram, bold_of, quotes_in, text_of
+from support import FakeHarness, FakeTelegram, bold_of, bot_message, quotes_in, text_of
 
 from userbot.bridge import Bridge, Identity, Incoming
 from userbot.content import Content, Quoted
 from userbot.harness import HHClient
+from userbot.music import MUSIC_BOT, Gate
+from userbot.parse import PARSE_BOT
 from userbot.store import MappingStore
 
 
 class ScriptedAgent:
-    """A harness that replies like the real one would, draft tool call included."""
+    """A harness that answers like the real one would.
+
+    `calls` is what the turn does, in order: `(tool name, arguments)` pairs. The
+    default is the one call every turn ends with, `tg_draft_response`.
+    """
+
+    #: the tools that declare a rollback, so a failed turn offers their undo
+    ROLLBACKS = ("tg_draft_response", "tg_send_music", "tg_send_parsed_content")
 
     def __init__(
         self,
@@ -24,15 +34,39 @@ class ScriptedAgent:
         missing_details: bool = False,
         missing_parent: str | None = None,
         quiet: bool = False,
+        calls: list[tuple[str, dict]] | None = None,
     ) -> None:
         self.summary, self.details = summary, details
         self.fail, self.draft = fail, draft
         self.missing_details = missing_details
         self.missing_parent = missing_parent
         self.quiet = quiet  # never emits a delta: the turn produces nothing
-        self.answered = asyncio.Event()
-        self.undone = asyncio.Event()
+        if calls is None:
+            calls = []
+            if draft:
+                arguments = {"summary": summary}
+                if not missing_details:
+                    arguments["details"] = details
+                calls = [("tg_draft_response", arguments)]
+        self.calls = list(calls)
+        self.answers = {self._call_id(index): asyncio.Event() for index in range(len(self.calls))}
+        self.undos = {
+            f"{self._call_id(index)}:rollback": asyncio.Event()
+            for index, (name, _) in enumerate(self.calls)
+            if name in self.ROLLBACKS
+        }
+        self.outcomes: dict[str, bool] = {}
         self.resolved: list[dict] = []
+
+    @staticmethod
+    def _call_id(index: int) -> str:
+        return f"call_{index + 1}"
+
+    def calls_named(self, name: str) -> list[tuple[str, dict]]:
+        return [call for call in self.calls if call[0] == name]
+
+    def answer_for(self, call_id: str) -> dict:
+        return next(command for command in self.resolved if command["call_id"] == call_id)
 
     async def __call__(self, harness, conn, command):
         name = command["command"]
@@ -72,7 +106,7 @@ class ScriptedAgent:
                 context_len=1,
                 model="fake-model",
                 tools=["get_current_time"],
-                local_tools=[],
+                local_tools=command.get("local_tools", []),
                 state_namespaces=[],
             )
             await self._done(conn, command)
@@ -80,16 +114,20 @@ class ScriptedAgent:
             asyncio.create_task(self._turn(conn, command))
         elif name == "resolve_tool":
             self.resolved.append(command)
+            call_id = command["call_id"]
+            self.outcomes[call_id] = "error" not in command
             await conn.emit(
                 event="local_tool_answered",
                 rid=command["rid"],
                 agent_id=command["id"],
-                call_id=command["call_id"],
-                ok="error" not in command,
+                call_id=call_id,
+                ok=self.outcomes[call_id],
                 result_chars=0,
             )
             await self._done(conn, command)
-            (self.answered if command["call_id"] == "call_1" else self.undone).set()
+            waiting = self.answers.get(call_id) or self.undos.get(call_id)
+            if waiting is not None:
+                waiting.set()
 
     async def _done(self, conn, command) -> None:
         await conn.emit(
@@ -119,16 +157,14 @@ class ScriptedAgent:
             await conn.emit(
                 event="reasoning_delta", agent_id=block, round=1, text="想一想", chars=3
             )
-        if self.draft:
-            arguments = {"summary": self.summary}
-            if not self.missing_details:
-                arguments["details"] = self.details
+        for index, (name, arguments) in enumerate(self.calls):
+            call_id = self._call_id(index)
             await conn.emit(
                 event="tool_call_requested",
                 agent_id=block,
                 round=1,
-                call_id="call_1",
-                name="tg_draft_response",
+                call_id=call_id,
+                name=name,
                 raw_arguments="{}",
                 known=True,
             )
@@ -136,52 +172,59 @@ class ScriptedAgent:
                 event="local_tool_called",
                 agent_id=block,
                 round=1,
-                call_id="call_1",
-                name="tg_draft_response",
+                call_id=call_id,
+                name=name,
                 kind="call",
                 arguments=arguments,
                 raw_arguments="{}",
                 timeout_ms=120_000,
             )
-            await asyncio.wait_for(self.answered.wait(), 3)
+            await asyncio.wait_for(self.answers[call_id].wait(), 3)
             await conn.emit(
                 event="tool_call_finished",
                 agent_id=block,
                 round=1,
-                call_id="call_1",
-                name="tg_draft_response",
-                ok=True,
-                error=None,
-                result="delivered",
-                result_chars=9,
+                call_id=call_id,
+                name=name,
+                ok=self.outcomes.get(call_id, True),
+                error=None if self.outcomes.get(call_id, True) else "client reported a failure",
+                result="ok",
+                result_chars=2,
                 elapsed_ms=1.0,
             )
         if self.fail:
-            if self.draft:
+            # a turn that does not commit is offered the undo of everything it did,
+            # newest call first
+            undoable = [
+                index for index, (name, _) in enumerate(self.calls) if name in self.ROLLBACKS
+            ]
+            for position, index in enumerate(reversed(undoable), start=1):
+                call_id = self._call_id(index)
+                name, arguments = self.calls[index]
                 await conn.emit(
                     event="rollback_started",
-                    call_id="call_1",
-                    tool="tg_draft_response",
-                    index=1,
-                    total=1,
+                    call_id=call_id,
+                    tool=name,
+                    index=position,
+                    total=len(undoable),
                 )
                 await conn.emit(
                     event="local_tool_rollback",
                     agent_id=block,
-                    call_id="call_1:rollback",
-                    name="tg_draft_response",
+                    call_id=f"{call_id}:rollback",
+                    name=name,
                     kind="rollback",
-                    rollback_of="call_1",
-                    arguments={},
-                    result="delivered",
+                    rollback_of=call_id,
+                    arguments=arguments,
+                    result="ok",
                     call_ok=True,
                     timeout_ms=120_000,
                 )
-                await asyncio.wait_for(self.undone.wait(), 3)
+                await asyncio.wait_for(self.undos[f"{call_id}:rollback"].wait(), 3)
                 await conn.emit(
                     event="rollback_finished",
-                    call_id="call_1",
-                    tool="tg_draft_response",
+                    call_id=call_id,
+                    tool=name,
                     ok=True,
                     error=None,
                     result="deleted",
@@ -218,7 +261,7 @@ class ScriptedAgent:
                 text="…",
                 text_chars=1,
                 rounds=1,
-                tool_calls=1 if self.draft else 0,
+                tool_calls=len(self.calls),
                 elapsed_ms=9.0,
                 messages=1,
                 context_len=1,
@@ -271,7 +314,9 @@ def reply_to(message_id=51, to=1000, text="继续说", quoted=None) -> Incoming:
     )
 
 
-async def run_bridge(agent, message, tmp_path, store_ready=None, identity=None):
+async def run_bridge(
+    agent, message, tmp_path, store_ready=None, identity=None, delivery_ready=None, music_gate=None
+):
     """Drive one message through the bridge; returns everything to assert on."""
     harness = await FakeHarness(agent).start()
     client = HHClient(harness.host, harness.port)
@@ -280,7 +325,11 @@ async def run_bridge(agent, message, tmp_path, store_ready=None, identity=None):
     store = MappingStore(str(tmp_path / "mappings.db"))
     if store_ready:
         store_ready(store)
-    bridge = Bridge(client, store, delivery, status_interval=0.0, identity=identity)
+    if delivery_ready:
+        delivery_ready(delivery)  # e.g. script the music bot's answers
+    bridge = Bridge(
+        client, store, delivery, status_interval=0.0, identity=identity, music_gate=music_gate
+    )
     try:
         await bridge.handle(message)
     finally:
@@ -332,13 +381,29 @@ def test_a_mention_opens_a_conversation_and_delivers_the_draft(tmp_path):
         harness, delivery, store = await run_bridge(agent, mention(), tmp_path)
         try:
             created = harness.commands_named("create_agent")[0]
-            assert [tool["name"] for tool in created["local_tools"]] == ["tg_draft_response"]
+            assert [tool["name"] for tool in created["local_tools"]] == [
+                "tg_draft_response",
+                "tg_search_music",
+                "tg_send_music",
+                "tg_send_parsed_content",
+            ]
             assert created["local_tools"][0]["rollback"] is True
+            # the harness must be willing to wait at least as long as the music
+            # tools do, or a slow fetch is reported as a tool timeout
+            assert created["local_timeout"] >= 300
 
             fork = harness.commands_named("fork")[0]
             assert "小明 (@ming, user id 7)" in fork["prompt"]
             assert "测试群 (@testgroup, group id -100)" in fork["prompt"]
             assert "你好 @bot" in fork["prompt"]
+            # the turn is forked with the tools themselves, not just the root
+            assert [tool["name"] for tool in fork["local_tools"]] == [
+                "tg_draft_response",
+                "tg_search_music",
+                "tg_send_music",
+                "tg_send_parsed_content",
+            ]
+            assert fork["local_timeout"] >= 300
 
             # the status message went out as a reply and was taken down again
             status, answer = delivery.sent[0], delivery.sent[1]
@@ -378,6 +443,13 @@ def test_a_reply_continues_the_conversation_it_answered(tmp_path):
             fork = harness.commands_named("fork")[0]
             assert fork["id"] == "tg-old"  # forked from the block that answered, not a root
             assert harness.commands_named("create_agent") == []
+            # a conversation continuing an older chain still gets today's tools
+            assert [tool["name"] for tool in fork["local_tools"]] == [
+                "tg_draft_response",
+                "tg_search_music",
+                "tg_send_music",
+                "tg_send_parsed_content",
+            ]
             assert "replies to one you sent earlier" in fork["prompt"]
             assert delivery.sent[1]["reply_to"] == 51
         finally:
@@ -591,6 +663,318 @@ def test_every_message_of_a_long_reply_is_mapped(tmp_path):
             for answer in answers:
                 assert store.lookup(-100, answer["id"]) == block
                 assert quotes_in(answer)[0].collapsed is True
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+# --- the music tools ---------------------------------------------------------
+
+
+def answer_music(answers):
+    """A `delivery_ready` hook: the music bot replies to each command it is sent."""
+
+    def prepare(delivery):
+        def on_send(chat_id, text):
+            if chat_id != MUSIC_BOT:
+                return
+            for prefix, message in answers.items():
+                if text.startswith(prefix):
+                    delivery.inbox.append(
+                        bot_message(
+                            id=message.get("id", 900),
+                            chat_id=chat_id,
+                            text=message.get("text", ""),
+                            has_buttons=message.get("has_buttons", False),
+                            has_music=message.get("has_music", False),
+                        )
+                    )
+
+        delivery.on_send = on_send
+
+    return prepare
+
+
+def commands_to_bot(delivery) -> list[str]:
+    return [message["text"] for message in delivery.sent if message["chat_id"] == MUSIC_BOT]
+
+
+def test_a_search_reaches_the_agent_as_the_bots_listing(tmp_path):
+    listing = "🎶 QQ Music search results\n1. 「明天，你好 (https://y.qq.com/x)」 - 牛奶咖啡"
+    agent = ScriptedAgent(
+        calls=[
+            ("tg_search_music", {"keyword": "你好", "platform": "QQMusic"}),
+            ("tg_draft_response", {"summary": "找到了", "details": "有这些版本。"}),
+        ]
+    )
+
+    async def scenario():
+        _, delivery, store = await run_bridge(
+            agent,
+            mention(),
+            tmp_path,
+            delivery_ready=answer_music({"/search": {"text": listing, "has_buttons": True}}),
+        )
+        try:
+            assert commands_to_bot(delivery) == ["/search 你好 qq"]
+            assert agent.answer_for("call_1")["result"] == listing
+            # the draft still follows, and the listing is not sent to the chat
+            replies = [message for message in delivery.sent if message["chat_id"] == -100]
+            assert replies[-1]["text"] == "找到了\n\n有这些版本。"
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_searching_falls_back_when_the_platform_is_not_offered(tmp_path):
+    agent = ScriptedAgent(
+        calls=[
+            ("tg_search_music", {"keyword": "你好", "platform": "Spotify"}),
+            ("tg_draft_response", {"summary": "s", "details": "d"}),
+        ]
+    )
+
+    async def scenario():
+        _, delivery, store = await run_bridge(agent, mention(), tmp_path)
+        try:
+            assert commands_to_bot(delivery) == []
+            assert "platform" in agent.answer_for("call_1")["error"]
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_sending_music_forwards_the_file_into_the_chat(tmp_path):
+    agent = ScriptedAgent(
+        calls=[
+            ("tg_send_music", {"url": "https://y.qq.com/x", "platform": "AppleMusic"}),
+            ("tg_draft_response", {"summary": "发好了", "details": "听听看。"}),
+        ]
+    )
+
+    async def scenario():
+        harness, delivery, store = await run_bridge(
+            agent,
+            mention(),
+            tmp_path,
+            delivery_ready=answer_music({"/music": {"id": 77, "has_music": True}}),
+        )
+        try:
+            assert commands_to_bot(delivery) == ["/music https://y.qq.com/x am"]
+            assert delivery.forwarded == [
+                {"id": delivery.forwarded[0]["id"], "from": MUSIC_BOT, "message_id": 77, "to": -100}
+            ]
+            assert "sent to the chat" in agent.answer_for("call_1")["result"]
+            # the forwarded track belongs to the block too, so a reply to it
+            # continues this conversation
+            forwarded_id = delivery.forwarded[0]["id"]
+            assert store.lookup(-100, forwarded_id) == harness.commands_named("fork")[0]["new_id"]
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_refusal_from_the_music_bot_comes_back_as_the_result(tmp_path):
+    agent = ScriptedAgent(
+        calls=[
+            ("tg_send_music", {"url": "https://x/y", "platform": "NetEase"}),
+            ("tg_draft_response", {"summary": "s", "details": "d"}),
+        ]
+    )
+
+    async def scenario():
+        _, delivery, store = await run_bridge(
+            agent,
+            mention(),
+            tmp_path,
+            delivery_ready=answer_music({"/music": {"text": "fail: no such track"}}),
+        )
+        try:
+            assert commands_to_bot(delivery) == ["/music https://x/y 163"]
+            assert delivery.forwarded == []
+            assert agent.answer_for("call_1")["result"] == "fail: no such track"
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_failed_turn_takes_the_music_back_with_the_reply(tmp_path):
+    agent = ScriptedAgent(
+        fail=True,
+        calls=[
+            ("tg_send_music", {"url": "https://y.qq.com/x", "platform": "Soda"}),
+            ("tg_draft_response", {"summary": "s", "details": "d"}),
+        ],
+    )
+
+    async def scenario():
+        _, delivery, store = await run_bridge(
+            agent,
+            mention(),
+            tmp_path,
+            delivery_ready=answer_music({"/music": {"id": 77, "has_music": True}}),
+        )
+        try:
+            forwarded_id = delivery.forwarded[0]["id"]
+            reply_id = delivery.sent[-2]["id"]  # the draft, just before the notice
+            assert (-100, (forwarded_id,)) in delivery.deleted
+            assert (-100, (reply_id,)) in delivery.deleted
+            # nothing of the turn is left to reply to
+            assert store.lookup(-100, forwarded_id) is None
+            assert store.lookup(-100, reply_id) is None
+            assert "agent failed" in delivery.sent[-1]["text"]
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_the_status_message_names_the_music_tool(tmp_path):
+    agent = ScriptedAgent(
+        calls=[
+            ("tg_search_music", {"keyword": "你好", "platform": "NetEase"}),
+            ("tg_draft_response", {"summary": "s", "details": "d"}),
+        ]
+    )
+
+    async def scenario():
+        _, delivery, store = await run_bridge(
+            agent,
+            mention(),
+            tmp_path,
+            delivery_ready=answer_music({"/search": {"text": "🎶 结果", "has_buttons": True}}),
+        )
+        try:
+            assert any("tg_search_music" in edit["text"] for edit in delivery.edits)
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_music_failure_reaches_the_agent_as_a_tool_error(tmp_path):
+    agent = ScriptedAgent(
+        calls=[
+            ("tg_search_music", {"keyword": "你好", "platform": "NetEase"}),
+            ("tg_draft_response", {"summary": "s", "details": "d"}),
+        ]
+    )
+
+    async def scenario():
+        _, delivery, store = await run_bridge(agent, mention(), tmp_path)  # the bot never answers
+        try:
+            assert agent.outcomes["call_1"] is False
+            assert "said nothing within" in agent.answer_for("call_1")["error"]
+            # a failed tool does not end the turn: the draft still went out
+            replies = [message for message in delivery.sent if message["chat_id"] == -100]
+            assert replies[-1]["text"] == "s\n\nd"
+            assert any("❌ tg_search_music failed" in edit["text"] for edit in delivery.edits)
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_the_music_rate_limit_is_shared_by_the_whole_userbot(tmp_path):
+    """One gate per userbot, not one per conversation."""
+    agent = ScriptedAgent(
+        calls=[
+            ("tg_search_music", {"keyword": "你好", "platform": "NetEase"}),
+            ("tg_search_music", {"keyword": "晚安", "platform": "Soda"}),
+            ("tg_draft_response", {"summary": "s", "details": "d"}),
+        ]
+    )
+    asked: list[float] = []
+
+    def ready(delivery):
+        def on_send(chat_id, text):
+            if chat_id != MUSIC_BOT:
+                return
+            asked.append(time.monotonic())
+            delivery.inbox.append(bot_message(chat_id=chat_id, text="🎶 结果", has_buttons=True))
+
+        delivery.on_send = on_send
+
+    async def scenario():
+        _, delivery, store = await run_bridge(
+            agent,
+            mention(),
+            tmp_path,
+            delivery_ready=ready,
+            music_gate=Gate(gap=0.03),
+        )
+        try:
+            assert len(asked) == 2
+            assert asked[1] - asked[0] >= 0.03  # the second waited for the gate
+            assert commands_to_bot(delivery) == ["/search 你好 163", "/search 晚安 qs"]
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_parsed_content_is_forwarded_and_stays_repliable(tmp_path):
+    agent = ScriptedAgent(
+        calls=[
+            ("tg_send_parsed_content", {"url": "https://v.douyin.com/xyz"}),
+            ("tg_draft_response", {"summary": "发好了", "details": "看上面。"}),
+        ]
+    )
+
+    def ready(delivery):
+        def on_send(chat_id, text):
+            if chat_id != PARSE_BOT:
+                return
+            delivery.inbox.append(
+                bot_message(
+                    id=88,
+                    chat_id=chat_id,
+                    reply_to=delivery.sent[-1]["id"],
+                    text="解析结果",
+                    has_link=True,
+                )
+            )
+
+        delivery.on_send = on_send
+
+    async def scenario():
+        harness, delivery, store = await run_bridge(
+            agent, mention(), tmp_path, delivery_ready=ready
+        )
+        try:
+            assert [
+                message["text"] for message in delivery.sent if message["chat_id"] == PARSE_BOT
+            ] == ["https://v.douyin.com/xyz"]
+            assert delivery.forwarded[-1]["to"] == -100
+            assert "sent to the chat" in agent.answer_for("call_1")["result"]
+            # the forwarded content is the userbot's message: replying continues here
+            forwarded_id = delivery.forwarded[0]["id"]
+            assert store.lookup(-100, forwarded_id) == harness.commands_named("fork")[0]["new_id"]
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_parse_that_never_answers_reaches_the_agent_as_an_error(tmp_path):
+    agent = ScriptedAgent(
+        calls=[
+            ("tg_send_parsed_content", {"url": "https://v.douyin.com/xyz"}),
+            ("tg_draft_response", {"summary": "s", "details": "d"}),
+        ]
+    )
+
+    async def scenario():
+        _, delivery, store = await run_bridge(agent, mention(), tmp_path)  # the bot never replies
+        try:
+            assert agent.outcomes["call_1"] is False
+            assert "said nothing within" in agent.answer_for("call_1")["error"]
+            assert delivery.forwarded == []
         finally:
             store.close()
 

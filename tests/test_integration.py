@@ -150,8 +150,12 @@ def test_a_draft_round_trip_and_the_reply_that_follows_it(tmp_path):
             blocks = fixture.blocks()
             assert blocks[first]["outcome"] == "ok"
             local = blocks[first]["local_tools"]
-            assert "tg_draft_response" in [
-                item["name"] if isinstance(item, dict) else item for item in local
+            names = [item["name"] if isinstance(item, dict) else item for item in local]
+            assert names == [
+                "tg_draft_response",
+                "tg_search_music",
+                "tg_send_music",
+                "tg_send_parsed_content",
             ]
 
             # replying to the answer joins that conversation instead of starting one
@@ -164,6 +168,17 @@ def test_a_draft_round_trip_and_the_reply_that_follows_it(tmp_path):
             second = store.lookup(CHAT, follow_up.sent[1]["id"])
             blocks = fixture.blocks()
             assert blocks[second]["parent"] == first
+            # the fork carried the tools, so the continuing turn has them too
+            names = [
+                item["name"] if isinstance(item, dict) else item
+                for item in blocks[second]["local_tools"]
+            ]
+            assert names == [
+                "tg_draft_response",
+                "tg_search_music",
+                "tg_send_music",
+                "tg_send_parsed_content",
+            ]
             # it carries the whole exchange: the prompt, the tool call, the answer
             assert blocks[second]["context_len"] > blocks[first]["context_len"]
         finally:
