@@ -218,6 +218,30 @@ under `[instant view content]`. A message with no text at all still says
 The userbot's own messages are sent with `link_preview=False`, so a reply that
 contains a link never grows a preview — and never an Instant View button.
 
+### Files into a sandbox
+
+| tool | what happens |
+|---|---|
+| `tg_download_file_to_sandbox(chat_id, message_id, sandbox_id, path)` | the file a message carries is downloaded and written into a live harness sandbox at `path`; the bytes go straight there, never through the model |
+
+The userbot fetches the file — Telethon's `download_media` — and hands what it got
+to the harness's own `nix_add_file` as a **tool pipe**. The model is shown the two
+tool names and what the sandbox wrote, and the file itself stays out of the
+transcript however large it is; the ceiling is **5 MB**, because a piped argument
+travels as base64 inside one command, which the harness refuses past 8 MiB.
+
+`chat_id` names the chat the way the reading tools do — a public `@name`, or the
+id they print — and `path` has to be under the sandbox's writable `/workspace`,
+the only place a file outlives the `nix_exec` that made it (`/workspace/../…` is
+refused rather than followed). A message that carries no file, a destination
+somewhere else, a chat that cannot be read and a sandbox that is no longer live
+all come back as **tool errors**, so the agent can look again rather than assume
+the file is there.
+
+This is the one tool that needs a harness speaking protocol `4` — tool pipes
+arrived with it. On an older one the call answers with an error instead of
+fetching a file nothing could carry.
+
 ## Requirements
 
 - Python ≥ 3.10 and [`uv`](https://docs.astral.sh/uv/)
@@ -323,6 +347,10 @@ auto-vacuum hands them back, so the file stays near the budget.
   `tg_send_parsed_content` — declare a rollback, so a turn that fails after they
   did takes the messages back down (and drops their mappings) before the failure
   notice explains what happened.
+- `tg_download_file_to_sandbox` declares an external effect and no rollback: the
+  file it puts into a sandbox is there to stay, and the failure note says so
+  rather than letting the next model assume the sandbox is clean. The harness's
+  own `nix_add_file`, which the pipe ends on, declares the same.
 - If the harness has forgotten the block a reply points at (eviction, or another
   database), the conversation restarts from a fresh root instead of staying silent.
 
@@ -347,6 +375,7 @@ userbot/content.py   what a message carries: text, media placeholders, Instant V
 userbot/music.py     the two tools that reach the music bot
 userbot/parse.py     the tool that has the parse bot render a link
 userbot/history.py   the tools that read a chat, one message, or forward it
+userbot/sandbox.py   the tool that carries a chat's file into a sandbox
 userbot/relay.py     the shape both share: ask a bot, wait for its answer
 userbot/tools.py     what the local tools share: their answer, their arguments
 userbot/harness.py   the harness wire protocol, one connection, many conversations

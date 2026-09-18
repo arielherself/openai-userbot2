@@ -8,7 +8,7 @@ from dataclasses import replace
 from datetime import datetime, timezone
 
 from userbot.content import Content
-from userbot.telegram import BotMessage, ChatMessage, ChatView
+from userbot.telegram import BotMessage, ChatMessage, ChatView, DownloadedFile
 
 DEFAULTS = {"endpoint": "https://provider.invalid/v1", "model": "fake-model", "has_key": True}
 
@@ -35,10 +35,10 @@ class FakeHarness:
     whatever that command's events should be.
     """
 
-    def __init__(self, script, defaults=None, protocol=3) -> None:
+    def __init__(self, script, defaults=None, protocol=4) -> None:
         self.script = script
         self.defaults = dict(defaults or DEFAULTS)
-        self.protocol = protocol  # 3 is the version that carries images
+        self.protocol = protocol  # 4 is the version that carries images and pipes
         self.commands: list[dict] = []
         self.connections: list[Conn] = []
         self.host = "127.0.0.1"
@@ -125,6 +125,10 @@ class FakeTelegram:
         # What a chat holds, for the tools that read history: id or @username -> view.
         self.chats: dict = {}
         self.fail_history = False
+        # What a message carries, for the download tool: (chat_id, message_id) -> bytes.
+        self.files: dict[tuple, bytes] = {}
+        self.fail_download = False
+        self.downloaded: list[tuple] = []
         self._next_id = 1000
         self._listeners: list[tuple] = []
 
@@ -197,6 +201,16 @@ class FakeTelegram:
         if images:
             return found
         return replace(found, images=[])  # pictures only when they were asked for
+
+    async def download(self, chat_id, message_id):
+        """The file a message carries, as the real one would hand it over."""
+        self.downloaded.append((chat_id, message_id))
+        if self.fail_download:
+            raise RuntimeError("telegram said no")
+        data = self.files.get((chat_id, message_id))
+        if data is None:
+            return None
+        return DownloadedFile(name=f"file-{message_id}.bin", data=data)
 
     async def forward(self, chat_id, message_id, to_chat_id) -> int:
         if self.fail_forward:

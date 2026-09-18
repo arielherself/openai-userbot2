@@ -37,6 +37,9 @@ from .music import send as send_music
 from .parse import TOOL as PARSE_TOOL
 from .parse import send as send_parsed
 from .render import MAX_UNITS, build_reply_parts, clamp_units
+from .sandbox import TOOL as DOWNLOAD_TOOL
+from .sandbox import download_to_sandbox
+from .sandbox import read_arguments as download_arguments
 from .status import StatusMessage, TurnStatus
 from .telegram import MAX_IMAGES
 from .tools import chat_argument, message_id_argument, text_argument
@@ -51,12 +54,16 @@ VIEW_CURRENT_TOOL_NAME = VIEW_TOOLS[0]["name"]
 VIEW_PUBLIC_TOOL_NAME = VIEW_TOOLS[1]["name"]
 READ_TOOL_NAME = VIEW_TOOLS[2]["name"]
 FORWARD_TOOL_NAME = VIEW_TOOLS[3]["name"]
+DOWNLOAD_TOOL_NAME = DOWNLOAD_TOOL["name"]
 
 # The protocol that carries images on a fork and on a tool result.
 IMAGE_PROTOCOL = 3
+# The protocol that carries a tool pipe: a local tool answering with the tool to
+# run next, which is how a file reaches a sandbox without passing through the model.
+PIPE_PROTOCOL = 4
 
 # Everything the agent can ask this userbot to do.
-LOCAL_TOOLS = [TG_DRAFT_TOOL, SEARCH_TOOL, SEND_TOOL, PARSE_TOOL, *VIEW_TOOLS]
+LOCAL_TOOLS = [TG_DRAFT_TOOL, SEARCH_TOOL, SEND_TOOL, PARSE_TOOL, DOWNLOAD_TOOL, *VIEW_TOOLS]
 
 # The tools that declare a rollback: a turn that failed undoes their work.
 UNDOABLE = (TOOL_NAME, SEARCH_TOOL_NAME, SEND_TOOL_NAME, PARSE_TOOL_NAME, FORWARD_TOOL_NAME)
@@ -468,6 +475,8 @@ class Bridge:
             await self._send_music(turn, event, agent_id, call_id)
         elif name == PARSE_TOOL_NAME:
             await self._send_parsed(turn, event, agent_id, call_id)
+        elif name == DOWNLOAD_TOOL_NAME:
+            await self._download_to_sandbox(event, agent_id, call_id)
         elif name == VIEW_CURRENT_TOOL_NAME:
             await self._read_current(turn, agent_id, call_id)
         elif name == VIEW_PUBLIC_TOOL_NAME:
@@ -561,6 +570,32 @@ class Bridge:
         self._forwarded(turn, call_id, answer)
         await self._answer(agent_id, call_id, answer)
 
+    async def _download_to_sandbox(self, event: dict, agent_id: str, call_id: str) -> None:
+        """A message's file, fetched here and piped into the sandbox as bytes."""
+        if not self._takes_pipes():
+            await self.hh.resolve_tool(
+                agent_id,
+                call_id,
+                error=(
+                    "this harness cannot hand a file to a sandbox: tool pipes "
+                    "arrived in protocol 4, and it speaks "
+                    f"{(self.hh.hello or {}).get('protocol')}"
+                ),
+            )
+            return
+        arguments, complaint = download_arguments(event.get("arguments") or {})
+        if complaint is not None:
+            await self.hh.resolve_tool(agent_id, call_id, error=complaint)
+            return
+        log.info(
+            "downloading message %s of chat %s into sandbox %s at %s",
+            arguments["message_id"],
+            arguments["chat_id"],
+            arguments["sandbox_id"],
+            arguments["path"],
+        )
+        await self._answer(agent_id, call_id, await download_to_sandbox(self.delivery, **arguments))
+
     def _forwarded(self, turn: _Turn, call_id: str, answer) -> None:
         """A message a tool put into the chat is the userbot's, like any other."""
         if answer.forwarded is None:
@@ -607,6 +642,11 @@ class Bridge:
         protocol = (self.hh.hello or {}).get("protocol")
         return isinstance(protocol, int) and protocol >= IMAGE_PROTOCOL
 
+    def _takes_pipes(self) -> bool:
+        """Whether the harness we are talking to can run a tool our answer names."""
+        protocol = (self.hh.hello or {}).get("protocol")
+        return isinstance(protocol, int) and protocol >= PIPE_PROTOCOL
+
     def _images(self, message: Incoming) -> list[str]:
         """The pictures to send with a fork: what this is about, and what it quotes."""
         images = list(message.images)
@@ -618,10 +658,16 @@ class Bridge:
         return images
 
     async def _answer(self, agent_id: str, call_id: str, answer) -> None:
-        """Tell the model what a tool did, or why it could not."""
+        """Tell the model what a tool did, or why it could not.
+
+        An answer that names the tool to run next does not reach the model at
+        all: the harness runs that one, and what the model reads is its output.
+        """
         if answer.error:
             log.warning("%s failed: %s", call_id, answer.error)
             await self.hh.resolve_tool(agent_id, call_id, error=answer.error)
+        elif answer.call is not None:
+            await self.hh.resolve_tool(agent_id, call_id, result=answer.result, call=answer.call)
         else:
             await self.hh.resolve_tool(
                 agent_id, call_id, result=answer.result, images=answer.images

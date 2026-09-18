@@ -32,6 +32,10 @@ Entity = int | str
 MAX_IMAGE_BYTES = 3 * 1024 * 1024
 MAX_IMAGES_BYTES = 5 * 1024 * 1024
 MAX_IMAGES = 4
+# How much file to hand over. A file is piped into a tool as base64 in one
+# command, and the harness refuses a command over 8 MiB, so five megabytes of
+# bytes is a third under the ceiling with room for the rest of the line.
+MAX_FILE_BYTES = 5 * 1024 * 1024
 # Photos come in several sizes; wide enough to read, narrow enough to be small.
 USEFUL_WIDTH = 1280
 
@@ -53,6 +57,14 @@ class BotMessage:
     has_link: bool = False
     has_buttons: bool = False
     has_music: bool = False
+
+
+@dataclass
+class DownloadedFile:
+    """A file Telegram handed over: what it is called, and its bytes."""
+
+    name: str
+    data: bytes
 
 
 @dataclass
@@ -144,6 +156,14 @@ class Delivery(Protocol):
         """One message of a chat, or None when there is no such message.
 
         `images` asks for its pictures to be fetched and carried along too.
+        """
+
+    async def download(self, chat_id: Entity, message_id: int) -> DownloadedFile | None:
+        """The file a message carries, bytes and name, or None when it carries none.
+
+        None covers a message that is not there as much as a message with no file
+        in it. A file too large to hand over, or a chat that cannot be read at
+        all, is an error rather than a download.
         """
 
 
@@ -282,6 +302,27 @@ class TelethonDelivery:
             read.images = await images_of(self.client, found)
         await with_replies(self.client, chat_id, [read])
         return read
+
+    async def download(self, chat_id, message_id) -> DownloadedFile | None:
+        found = await self.client.get_messages(chat_id, ids=message_id)
+        if not isinstance(found, TelegramMessage) or found.file is None:
+            return None
+        declared = found.file.size or 0
+        if declared > MAX_FILE_BYTES:
+            raise ValueError(
+                f"the file is {declared} bytes; the most that can be handed over "
+                f"is {MAX_FILE_BYTES}"
+            )
+        handle = await self.client.download_media(found, file=io.BytesIO())
+        raw = handle.getvalue() if handle is not None else b""
+        if not raw:
+            raise ValueError("Telegram handed over nothing")
+        if len(raw) > MAX_FILE_BYTES:
+            raise ValueError(
+                f"the file is {len(raw)} bytes; the most that can be handed over "
+                f"is {MAX_FILE_BYTES}"
+            )
+        return DownloadedFile(name=found.file.name or "", data=raw)
 
 
 async def images_of(client, message, budget: int = MAX_IMAGES_BYTES) -> list[str]:

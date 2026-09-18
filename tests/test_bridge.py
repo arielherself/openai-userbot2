@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import time
 
 from support import (
@@ -71,6 +72,8 @@ class ScriptedAgent:
         }
         self.outcomes: dict[str, bool] = {}
         self.resolved: list[dict] = []
+        # What a piped step said, by tool name — what the sandbox "wrote".
+        self.piped: dict[str, str] = {}
 
     @staticmethod
     def _call_id(index: int) -> str:
@@ -136,12 +139,62 @@ class ScriptedAgent:
                 agent_id=command["id"],
                 call_id=call_id,
                 ok=self.outcomes[call_id],
-                result_chars=0,
+                result_chars=len(command.get("result") or ""),
+                next=(command.get("call") or {}).get("name"),
             )
             await self._done(conn, command)
             waiting = self.answers.get(call_id) or self.undos.get(call_id)
             if waiting is not None:
                 waiting.set()
+
+    async def _piped(self, conn, block, call_id, name) -> tuple[str, list[str] | None, int]:
+        """The events for a call the client answered with `call` instead of text.
+
+        The real harness runs that tool itself and follows the chain until one
+        answers with text; one step is enough here, and what it says is what the
+        test scripted for it — the point is the shape of what comes back.
+        """
+        call = self.answer_for(call_id).get("call")
+        if not call:
+            return "ok", None, 0
+        step_id = f"{call_id}:pipe:1"
+        chain = [name, call["name"]]
+        text = self.piped.get(call["name"], "done")
+        arguments = call.get("arguments", {})
+        await conn.emit(
+            event="pipe_step_started",
+            agent_id=block,
+            round=1,
+            call_id=step_id,
+            parent_call_id=call_id,
+            step=1,
+            name=call["name"],
+            via="server",
+            known=True,
+            arguments=arguments,
+            chain=chain,
+        )
+        await conn.emit(
+            event="pipe_step_finished",
+            agent_id=block,
+            round=1,
+            call_id=step_id,
+            parent_call_id=call_id,
+            step=1,
+            name=call["name"],
+            via="server",
+            known=True,
+            arguments=arguments,
+            chain=chain,
+            ok=True,
+            error=None,
+            text=text,
+            text_chars=len(text),
+            image_count=0,
+            next=None,
+            elapsed_ms=1.0,
+        )
+        return f"[tool pipe] {' -> '.join(chain)}\n{text}", chain, 1
 
     async def _done(self, conn, command) -> None:
         await conn.emit(
@@ -194,6 +247,7 @@ class ScriptedAgent:
                 timeout_ms=120_000,
             )
             await asyncio.wait_for(self.answers[call_id].wait(), 3)
+            result, chain, steps = await self._piped(conn, block, call_id, name)
             await conn.emit(
                 event="tool_call_finished",
                 agent_id=block,
@@ -202,9 +256,10 @@ class ScriptedAgent:
                 name=name,
                 ok=self.outcomes.get(call_id, True),
                 error=None if self.outcomes.get(call_id, True) else "client reported a failure",
-                result="ok",
-                result_chars=2,
+                result=result,
+                result_chars=len(result),
                 elapsed_ms=1.0,
+                **({"chain": chain, "steps": steps} if chain else {}),
             )
         if self.fail:
             # a turn that does not commit is offered the undo of everything it did,
@@ -400,6 +455,7 @@ def test_a_mention_opens_a_conversation_and_delivers_the_draft(tmp_path):
                 "tg_search_music",
                 "tg_send_music",
                 "tg_send_parsed_content",
+                "tg_download_file_to_sandbox",
                 "tg_view_current_chat",
                 "tg_view_public_chat",
                 "tg_read_message",
@@ -420,6 +476,7 @@ def test_a_mention_opens_a_conversation_and_delivers_the_draft(tmp_path):
                 "tg_search_music",
                 "tg_send_music",
                 "tg_send_parsed_content",
+                "tg_download_file_to_sandbox",
                 "tg_view_current_chat",
                 "tg_view_public_chat",
                 "tg_read_message",
@@ -471,6 +528,7 @@ def test_a_reply_continues_the_conversation_it_answered(tmp_path):
                 "tg_search_music",
                 "tg_send_music",
                 "tg_send_parsed_content",
+                "tg_download_file_to_sandbox",
                 "tg_view_current_chat",
                 "tg_view_public_chat",
                 "tg_read_message",
@@ -1004,6 +1062,119 @@ def test_a_parse_that_never_answers_reaches_the_agent_as_an_error(tmp_path):
             assert "said nothing within" in agent.answer_for("call_1")["error"]
             assert delivery.forwarded == []
         finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+# --- files into a sandbox ----------------------------------------------------
+
+
+def file_into_sandbox(**overrides) -> tuple[str, dict]:
+    arguments = {
+        "chat_id": -100,
+        "message_id": 41,
+        "sandbox_id": "sbx-3f2a9c1b7d0e",
+        "path": "/workspace/report.pdf",
+    }
+    arguments.update(overrides)
+    return ("tg_download_file_to_sandbox", arguments)
+
+
+def test_a_telegram_file_reaches_the_sandbox_through_a_pipe(tmp_path):
+    data = b"%PDF-1.4 nope"
+    agent = ScriptedAgent(
+        calls=[
+            file_into_sandbox(),
+            ("tg_draft_response", {"summary": "拿到了", "details": "正在看那份 PDF。"}),
+        ]
+    )
+    agent.piped["nix_add_file"] = (
+        "Wrote 13 bytes to /workspace/report.pdf in sandbox sbx-3f2a9c1b7d0e."
+    )
+
+    def ready(delivery):
+        delivery.files[(-100, 41)] = data
+
+    async def scenario():
+        _, delivery, store = await run_bridge(agent, mention(), tmp_path, delivery_ready=ready)
+        try:
+            answer = agent.answer_for("call_1")
+            assert answer["call"]["name"] == "nix_add_file"
+            assert answer["call"]["arguments"] == {
+                "sandbox_id": "sbx-3f2a9c1b7d0e",
+                "path": "/workspace/report.pdf",
+                "content_base64": base64.b64encode(data).decode("ascii"),
+            }
+            # the download itself is a note for the pipe's trace, not for the model
+            assert "of file-41.bin" in answer["result"]
+            assert delivery.downloaded == [(-100, 41)]
+            assert agent.outcomes["call_1"] is True
+            # the turn went on and the reply still went out
+            assert delivery.live()[-1]["text"] == "拿到了\n\n正在看那份 PDF。"
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_destination_outside_the_workspace_is_refused_before_any_download(tmp_path):
+    agent = ScriptedAgent(
+        calls=[
+            file_into_sandbox(path="/etc/passwd"),
+            ("tg_draft_response", {"summary": "s", "details": "d"}),
+        ]
+    )
+
+    async def scenario():
+        _, delivery, store = await run_bridge(agent, mention(), tmp_path)
+        try:
+            answer = agent.answer_for("call_1")
+            assert "under /workspace" in answer["error"]
+            assert "call" not in answer
+            assert delivery.downloaded == []
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_message_that_carries_no_file_is_a_tool_error(tmp_path):
+    agent = ScriptedAgent(
+        calls=[file_into_sandbox(), ("tg_draft_response", {"summary": "s", "details": "d"})]
+    )
+
+    async def scenario():
+        _, delivery, store = await run_bridge(agent, mention(), tmp_path)
+        try:
+            answer = agent.answer_for("call_1")
+            assert "carries no file" in answer["error"]
+            assert delivery.downloaded == [(-100, 41)]  # it was looked at, and had none
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_harness_that_cannot_pipe_is_told_so(tmp_path):
+    agent = ScriptedAgent(
+        calls=[file_into_sandbox(), ("tg_draft_response", {"summary": "s", "details": "d"})]
+    )
+
+    async def scenario():
+        harness = await FakeHarness(agent, protocol=3).start()
+        client = HHClient(harness.host, harness.port)
+        await client.connect()
+        delivery = FakeTelegram()
+        store = MappingStore(str(tmp_path / "mappings.db"))
+        try:
+            await Bridge(client, store, delivery, status_interval=0.0).handle(mention())
+            answer = agent.answer_for("call_1")
+            assert "protocol 4" in answer["error"]
+            assert delivery.downloaded == []  # nothing was fetched for nothing
+        finally:
+            await client.close()
+            await harness.stop()
             store.close()
 
     asyncio.run(scenario())

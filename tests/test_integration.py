@@ -11,6 +11,7 @@ Skipped when there is no harness checkout to point at (see HH_TEST_PROJECT).
 from __future__ import annotations
 
 import asyncio
+import base64
 import importlib.util
 import json
 import os
@@ -75,9 +76,9 @@ class Fixture:
         return {block["agent_id"]: block for block in listed["agents"]}
 
 
-async def drive(fixture, store, conversation) -> FakeTelegram:
+async def drive(fixture, store, conversation, delivery=None) -> FakeTelegram:
     """Run messages through the bridge, against the real server."""
-    delivery = FakeTelegram()
+    delivery = FakeTelegram() if delivery is None else delivery
     harness = HHClient(fixture.server.host, fixture.server.port)
     await harness.connect()
     try:
@@ -153,6 +154,7 @@ def test_a_draft_round_trip_and_the_reply_that_follows_it(tmp_path):
             names = [item["name"] if isinstance(item, dict) else item for item in local]
             # the server keeps them in name order, whatever order we declared them
             assert sorted(names) == [
+                "tg_download_file_to_sandbox",
                 "tg_draft_response",
                 "tg_forward_message",
                 "tg_read_message",
@@ -179,6 +181,7 @@ def test_a_draft_round_trip_and_the_reply_that_follows_it(tmp_path):
                 for item in blocks[second]["local_tools"]
             ]
             assert sorted(names) == [
+                "tg_download_file_to_sandbox",
                 "tg_draft_response",
                 "tg_forward_message",
                 "tg_read_message",
@@ -190,6 +193,45 @@ def test_a_draft_round_trip_and_the_reply_that_follows_it(tmp_path):
             ]
             # it carries the whole exchange: the prompt, the tool call, the answer
             assert blocks[second]["context_len"] > blocks[first]["context_len"]
+        finally:
+            store.close()
+
+
+def test_a_telegram_file_is_piped_into_a_sandbox_without_being_quoted(tmp_path):
+    """The point of the pipe: the bytes reach the sandbox, not the transcript."""
+    with Fixture(tmp_path) as fixture:
+        store = MappingStore(str(tmp_path / "mappings.db"))
+        try:
+            payload = b"%PDF-1.4 the file's own bytes"
+            fixture.provider.tool_call(
+                "tg_download_file_to_sandbox",
+                {
+                    "chat_id": CHAT,
+                    "message_id": 41,
+                    "sandbox_id": "sbx-nosuch",
+                    "path": "/workspace/report.pdf",
+                },
+            )
+            fixture.provider.tool_call(
+                "tg_draft_response", {"summary": "拿到了", "details": "放进沙箱了。"}
+            )
+            fixture.provider.text("放好了。")
+
+            delivery = FakeTelegram()
+            delivery.files[(CHAT, 41)] = payload
+            asyncio.run(drive(fixture, store, [mention()], delivery))
+
+            assert delivery.live()[-1]["text"] == "拿到了\n\n放进沙箱了。"
+            # every request the provider saw, as one blob to search
+            sent = "\n".join(
+                json.dumps(request, ensure_ascii=False) for request in fixture.provider.payloads()
+            )
+            # the model was shown the pipe's own ends: both names, and what the
+            # sandbox tool said about the id it was handed
+            assert "[tool pipe] tg_download_file_to_sandbox -> nix_add_file" in sent
+            assert "Sandbox sbx-nosuch is not live" in sent
+            # and the bytes themselves were never part of any request
+            assert base64.b64encode(payload).decode("ascii") not in sent
         finally:
             store.close()
 

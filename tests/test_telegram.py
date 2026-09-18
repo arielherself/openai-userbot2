@@ -6,11 +6,13 @@ import asyncio
 import base64
 from datetime import datetime, timezone
 
+import pytest
 from telethon import events
 from telethon.tl import types
 from telethon.tl.custom import Message as TgMessage
 
 from userbot.telegram import (
+    MAX_FILE_BYTES,
     MAX_IMAGE_BYTES,
     MAX_IMAGES,
     TelethonDelivery,
@@ -28,6 +30,8 @@ class StubClient:
     def __init__(self, payload: bytes | None = None, fail: bool = False) -> None:
         self.payload = payload
         self.fail_download = fail
+        #: What `get_messages` hands back, for the tools that look one message up.
+        self.found = None
         self.handlers: list[tuple] = []
         self.sent: list[dict] = []
         self.edits: list[dict] = []
@@ -65,6 +69,9 @@ class StubClient:
         self.forwarded.append({"to": entity, "message_id": message_id, "from": from_peer})
         return message(id=12, text="")
 
+    async def get_messages(self, entity, ids=None):
+        return self.found
+
 
 def message(id=5, text="", media=None, reply_markup=None, entities=None) -> TgMessage:
     """A Telethon message, as an update would hand one over."""
@@ -91,6 +98,21 @@ def audio_document() -> types.MessageMediaDocument:
             size=1024,
             dc_id=2,
             attributes=[types.DocumentAttributeAudio(duration=3, title="歌")],
+        )
+    )
+
+
+def report_document(size=1024, name="report.pdf") -> types.MessageMediaDocument:
+    return types.MessageMediaDocument(
+        document=types.Document(
+            id=3,
+            access_hash=1,
+            file_reference=b"",
+            date=None,
+            dc_id=2,
+            mime_type="application/pdf",
+            size=size,
+            attributes=[types.DocumentAttributeFilename(file_name=name)],
         )
     )
 
@@ -154,6 +176,55 @@ def test_forwarding_returns_the_id_of_the_new_message():
         forwarded = await TelethonDelivery(client).forward("Music163DownBot", 77, -100)
         assert forwarded == 12
         assert client.forwarded == [{"to": -100, "message_id": 77, "from": "Music163DownBot"}]
+
+    asyncio.run(scenario())
+
+
+def test_a_messages_file_comes_back_with_its_name():
+    async def scenario():
+        client = StubClient(payload=b"%PDF-1.4 nope")
+        client.found = message(id=41, media=report_document())
+        downloaded = await TelethonDelivery(client).download(-100, 41)
+        assert downloaded.name == "report.pdf"
+        assert downloaded.data == b"%PDF-1.4 nope"
+        # the file itself, not a thumbnail of it
+        assert client.downloaded == [{"message": client.found, "thumb": None}]
+
+    asyncio.run(scenario())
+
+
+def test_a_message_with_nothing_to_download_hands_over_nothing():
+    async def scenario():
+        # a message that is not there at all
+        assert await TelethonDelivery(StubClient()).download(-100, 41) is None
+        # and one that is, but carries no file
+        plain = StubClient()
+        plain.found = message(id=41, text="no file here")
+        assert await TelethonDelivery(plain).download(-100, 41) is None
+        assert plain.downloaded == []
+
+    asyncio.run(scenario())
+
+
+def test_a_file_too_big_to_hand_over_is_refused_before_it_is_fetched():
+    async def scenario():
+        client = StubClient()
+        client.found = message(id=41, media=report_document(size=MAX_FILE_BYTES + 1))
+        with pytest.raises(ValueError) as refusal:
+            await TelethonDelivery(client).download(-100, 41)
+        assert str(MAX_FILE_BYTES) in str(refusal.value)
+        assert client.downloaded == []  # nothing was pulled down
+
+    asyncio.run(scenario())
+
+
+def test_a_file_that_turns_out_too_big_is_refused_too():
+    async def scenario():
+        # the declared size lied, and what arrived is over the line
+        client = StubClient(payload=b"x" * (MAX_FILE_BYTES + 1))
+        client.found = message(id=41, media=report_document(size=10))
+        with pytest.raises(ValueError):
+            await TelethonDelivery(client).download(-100, 41)
 
     asyncio.run(scenario())
 

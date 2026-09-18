@@ -7,7 +7,9 @@ conversation subscribes to its block id *and* to the rid of its `run`, and reads
 the turn's events — deltas, tool calls, the outcome — off one queue.
 
 Local tools are how a turn reaches back: the server parks the turn, we send
-`resolve_tool`, and the model continues with whatever we answered.
+`resolve_tool`, and the model continues with whatever we answered — or with
+whatever that answer named, when it answers with a `call` and the harness runs
+that tool next.
 """
 
 from __future__ import annotations
@@ -317,19 +319,29 @@ class HHClient:
         result: str | None = None,
         error: str | None = None,
         images: list[str] | None = None,
+        call: dict | None = None,
     ) -> bool:
         """Answer a parked local tool call (or the undo of one).
 
         `images`, when given, ride along with the result as `data:` URIs, so the
         model sees them the way it sees a fork's images. An answer that carries an
         error drops them: a failed call is text.
+
+        `call`, when given, is the tool to run next — `{"name": …, "arguments":
+        …}` — so the answer goes on as a tool pipe instead of ending here: the
+        harness runs it, and the model is shown that call's output in place of
+        this one. `result` is then a note for the pipe's trace, not for the
+        model, and the two are mutually exclusive with images, which only a
+        pipe's last call may carry.
         """
         fields: dict = {"command": "resolve_tool", "id": agent_id, "call_id": call_id}
         if error is not None:
             fields["error"] = error
         else:
             fields["result"] = "" if result is None else result
-            if images:
+            if call is not None:
+                fields["call"] = call
+            elif images:
                 fields["images"] = list(images)
         try:
             await self.command(**fields)

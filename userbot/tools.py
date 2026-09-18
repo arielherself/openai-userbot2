@@ -20,6 +20,10 @@ class Answer:
     forwarded: int | None = None
     # Pictures that go with the result, as `data:` URIs.
     images: list[str] = field(default_factory=list)
+    # The tool to run next, `{"name": …, "arguments": …}`, instead of reporting
+    # this result: the harness runs it and the model sees that tool's output.
+    # `result` then says what this step did, for the pipe's trace alone.
+    call: dict | None = None
 
 
 def text_argument(arguments: dict, field: str) -> tuple[str, str | None]:
