@@ -13,7 +13,7 @@ import base64
 import io
 import re
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Protocol
 
@@ -77,6 +77,12 @@ class ChatMessage:
     date: datetime | None = None
     # The message's images as `data:` URIs, when they were asked for.
     images: list[str] = field(default_factory=list)
+    # What it answers: the id it replies to, and that message itself when we could
+    # read it — a listing of replies is hard to follow without what they answer.
+    reply_to_id: int | None = None
+    reply_to: ChatMessage | None = None
+    # The part the sender highlighted, when they quoted a selection.
+    quote: str = ""
 
 
 @dataclass
@@ -259,6 +265,7 @@ class TelethonDelivery:
             if isinstance(message, TelegramMessage)
         ]
         read.reverse()  # Telegram hands them over newest first
+        await with_replies(self.client, entity, read)
         return ChatView(
             title=utils.get_display_name(entity) or "unnamed",
             username=getattr(entity, "username", None),
@@ -273,6 +280,7 @@ class TelethonDelivery:
         read = await chat_message(found)
         if images:
             read.images = await images_of(self.client, found)
+        await with_replies(self.client, chat_id, [read])
         return read
 
 
@@ -356,6 +364,7 @@ async def sender_of(message) -> Sender:
 async def chat_message(message) -> ChatMessage:
     """One message of a history, with its sender resolved."""
     sender = await sender_of(message)
+    header = message.reply_to
     return ChatMessage(
         id=message.id,
         sender_name=sender.name,
@@ -363,4 +372,35 @@ async def chat_message(message) -> ChatMessage:
         sender_id=sender.user_id,
         content=content_of(message),
         date=message.date,
+        reply_to_id=message.reply_to_msg_id,
+        quote=(getattr(header, "quote_text", None) or "").strip(),
     )
+
+
+async def with_replies(client, chat_id, messages: list[ChatMessage]) -> None:
+    """Fill in what each message answers, for the ones we do not already hold.
+
+    The missing ids are asked for in one go, so a listing full of replies costs a
+    single extra request rather than one per message, and a message we already
+    have is reused as it is.
+    """
+    known = {message.id: message for message in messages}
+    wanted = sorted(
+        {
+            message.reply_to_id
+            for message in messages
+            if message.reply_to_id and message.reply_to_id not in known
+        }
+    )
+    found: dict[int, ChatMessage] = {}
+    if wanted:
+        answers = await client.get_messages(chat_id, ids=wanted)
+        for answer in answers if isinstance(answers, list) else [answers]:
+            if isinstance(answer, TelegramMessage):
+                found[answer.id] = await chat_message(answer)
+    for message in messages:
+        quoted = known.get(message.reply_to_id) or found.get(message.reply_to_id)
+        if quoted is None:
+            continue
+        # one level is enough: the quoted message is described on its own
+        message.reply_to = replace(quoted, reply_to_id=None, reply_to=None, quote="")

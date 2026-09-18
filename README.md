@@ -92,7 +92,20 @@ Two more tools talk to a third-party music bot, [@Music163DownBot](https://t.me/
 Each message comes back oldest-first with its **message id**, the time it was
 sent (in the machine's own timezone, offset included), its sender — display name,
 `@username` when there is one, user id — and its full content, using the same
-media placeholders as the prompts. A message whose author Telegram hides fits the
+media placeholders as the prompts. A message that answers another one shows what
+it answers, on a line of its own:
+
+```
+2. [4822] 2026-09-18 12:13 +0800 小红 (@hong, user id 9):
+↩ in reply to [4821] 小明 (@ming): 今晚吃什么？
+火锅吧
+```
+
+The answered message is taken from the same reading when it is in the window, and
+asked for by id when it is older — one batched request however many replies there
+are — so a run of replies reads as a conversation. It is clipped to a line (the
+id is right there to read in full), a message that is gone is named as such, and a
+quote of a selection adds the part that was highlighted. A message whose author Telegram hides fits the
 same shape: an anonymous admin has no id or username to print, so it shows the
 signature it posts under, or simply `anonymous admin`, rather than a `user id 0`
 that means nothing. Being hidden says nothing about the media: a picture an

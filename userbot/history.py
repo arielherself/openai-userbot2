@@ -14,8 +14,9 @@ from datetime import datetime
 from .telegram import ChatView, Delivery
 from .tools import Answer
 
-# How many messages to read.
+# How many messages to read, and how much of an answered message to show.
 LIMIT = 50
+QUOTE_CHARS = 200
 
 VIEW_CURRENT_TOOL = {
     "name": "tg_view_current_chat",
@@ -23,7 +24,8 @@ VIEW_CURRENT_TOOL = {
         "Read this chat's recent messages: the last 50 of them, oldest first, each "
         "with its message id, the time it was sent, who sent it (display name, "
         "@username, user id) and its full content — text, and a placeholder for "
-        "anything that is not text.\n"
+        "anything that is not text. A message that answers another one shows what "
+        "it answers, so a run of replies reads as a conversation.\n"
         "Use it to see what was being discussed before you were asked, or what "
         "people said after a message you are looking at.\n"
         "Takes no parameters."
@@ -35,8 +37,8 @@ VIEW_PUBLIC_TOOL = {
     "name": "tg_view_public_chat",
     "description": (
         "Read the recent messages of another group or channel: its last 50, oldest "
-        "first, each with its message id, the time it was sent, who sent it, and "
-        "its full content.\n"
+        "first, each with its message id, the time it was sent, who sent it, its "
+        "full content, and what it answers when it is a reply.\n"
         "`username`: the chat's public name, starting with @ — like `@telegram`.\n"
         "Only public chats can be read this way, and only ones this account can "
         "see; a private chat has no username to give."
@@ -174,8 +176,33 @@ def sender_line(message) -> str:
 
 
 def entry(message) -> str:
-    """One message: who sent it, when, and what it said."""
-    return f"{sender_line(message)}\n{message.content.render()}"
+    """One message: who sent it, when, what it answers, and what it said."""
+    lines = [sender_line(message)]
+    if message.reply_to is not None or message.reply_to_id:
+        lines.append(quoted_line(message))
+    lines.append(message.content.render())
+    return "\n".join(lines)
+
+
+def quoted_line(message) -> str:
+    """`↩ in reply to [id] who: what it said` — one line, clipped, never recursive.
+
+    The quoted message is what makes a run of replies readable; when it is longer
+    than a line it is cut, and its id is right there to read in full.
+    """
+    quoted = message.reply_to
+    if quoted is None:
+        return f"↩ in reply to [{message.reply_to_id}] a message that is gone"
+    who = quoted.sender_name
+    if quoted.sender_username:
+        who += f" (@{quoted.sender_username})"
+    said = " ".join(quoted.content.render().split())
+    if len(said) > QUOTE_CHARS:
+        said = said[: QUOTE_CHARS - 1] + "…"
+    line = f"↩ in reply to [{quoted.id}] {who}: {said}"
+    if message.quote:
+        line += f"\n↩ they highlighted: {message.quote}"
+    return line
 
 
 def stamp(date: datetime | None) -> str:

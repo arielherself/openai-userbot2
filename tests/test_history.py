@@ -342,3 +342,99 @@ def test_a_message_from_a_hidden_sender_prints_what_there_is():
     assert "1. [1] 2026-09-18 12:12 +0800 anonymous admin:\n匿名发帖" in reading
     assert "user id 0" not in reading
     assert "2. [2] 2026-09-18 12:12 +0800 Channel:\n署名发帖" in reading
+
+
+def test_a_reply_shows_what_it_answers():
+    async def scenario():
+        delivery = FakeTelegram()
+        delivery.chats[-100] = chat_view(
+            chat_id=-100,
+            messages=[
+                chat_message(id=41, name="小红", username="hong", user_id=9, text="今晚吃什么？"),
+                chat_message(
+                    id=42,
+                    name="小明",
+                    username="ming",
+                    user_id=7,
+                    text="火锅吧",
+                    reply_to_id=41,
+                ),
+            ],
+        )
+
+        answer = await history.current_chat(delivery, -100)
+        assert answer.error == ""
+        assert "1. [41] " in answer.result and "今晚吃什么？" in answer.result
+        # the reply carries what it answers, in one line, right above what it says
+        assert "↩ in reply to [41] 小红 (@hong): 今晚吃什么？\n火锅吧" in answer.result
+
+    asyncio.run(scenario())
+
+
+def test_an_answered_message_is_looked_up_even_from_outside_the_window():
+    async def scenario():
+        delivery = FakeTelegram()
+        older = chat_message(id=1, name="小红", username="hong", user_id=9, text="很久以前说的")
+        recent = [
+            chat_message(id=100 + index, text=f"第 {index} 条") for index in range(history.LIMIT)
+        ]
+        delivery.chats[-100] = chat_view(
+            chat_id=-100,
+            messages=[older, *recent, chat_message(id=200, text="接着上面", reply_to_id=1)],
+        )
+
+        answer = await history.current_chat(delivery, -100)
+        assert "[1] 小红 (@hong): 很久以前说的" in answer.result
+        assert "第 0 条" not in answer.result  # still only the last 50 are listed
+
+    asyncio.run(scenario())
+
+
+def test_a_reply_to_a_message_that_is_gone_says_so():
+    async def scenario():
+        delivery = FakeTelegram()
+        delivery.chats[-100] = chat_view(
+            chat_id=-100, messages=[chat_message(id=42, text="上面那条", reply_to_id=41)]
+        )
+
+        answer = await history.current_chat(delivery, -100)
+        assert "↩ in reply to [41] a message that is gone" in answer.result
+
+    asyncio.run(scenario())
+
+
+def test_a_long_answer_is_cut_to_a_line():
+    async def scenario():
+        delivery = FakeTelegram()
+        delivery.chats[-100] = chat_view(
+            chat_id=-100,
+            messages=[
+                chat_message(id=41, text="很长的消息。" * 100),
+                chat_message(id=42, text="嗯", reply_to_id=41),
+            ],
+        )
+
+        answer = await history.current_chat(delivery, -100)
+        quoted = next(line for line in answer.result.splitlines() if line.startswith("↩ in reply"))
+        assert quoted.endswith("…") and len(quoted) < history.QUOTE_CHARS + 60
+
+    asyncio.run(scenario())
+
+
+def test_reading_one_message_shows_what_it_answers():
+    async def scenario():
+        delivery = FakeTelegram()
+        delivery.chats[-100] = chat_view(
+            chat_id=-100,
+            messages=[
+                chat_message(id=41, name="小红", username="hong", user_id=9, text="今晚吃什么？"),
+                chat_message(id=42, text="火锅吧", reply_to_id=41, quote="今晚"),
+            ],
+        )
+
+        answer = await history.read_message(delivery, -100, 42)
+        assert "↩ in reply to [41] 小红 (@hong): 今晚吃什么？" in answer.result
+        assert "↩ they highlighted: 今晚" in answer.result
+        assert answer.result.endswith("火锅吧")
+
+    asyncio.run(scenario())

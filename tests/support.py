@@ -166,12 +166,22 @@ class FakeTelegram:
             view = self.chats[chat_id]
         except KeyError:
             raise ValueError(f"no such chat: {chat_id}") from None
+        messages = list(view.messages[-limit:])  # the newest, as Telegram gives them
         return ChatView(
             title=view.title,
             username=view.username,
             chat_id=view.chat_id,
-            messages=list(view.messages[-limit:]),  # the newest, as Telegram gives them
+            messages=[await self._with_reply(one, view) for one in messages],
         )
+
+    async def _with_reply(self, message, view):
+        """What a message answers, looked up the way the real one looks it up."""
+        if message.reply_to is not None or not message.reply_to_id:
+            return message
+        quoted = next((one for one in view.messages if one.id == message.reply_to_id), None)
+        if quoted is None:
+            return message
+        return replace(message, reply_to=replace(quoted, reply_to=None, reply_to_id=None, quote=""))
 
     async def message(self, chat_id, message_id, images=False):
         if self.fail_history:
@@ -180,7 +190,11 @@ class FakeTelegram:
         if view is None:
             raise ValueError(f"no such chat: {chat_id}")
         found = next((one for one in view.messages if one.id == message_id), None)
-        if found is None or images:
+        if found is None:
+            return None
+        # the same as the real one: a message brings what it answers
+        found = await self._with_reply(found, view)
+        if images:
             return found
         return replace(found, images=[])  # pictures only when they were asked for
 
@@ -286,7 +300,17 @@ SENT_AT = datetime(2026, 9, 18, 4, 12, tzinfo=timezone.utc)
 
 
 def chat_message(
-    id=1, name="小明", username="ming", user_id=7, text="", media="", date=SENT_AT, images=None
+    id=1,
+    name="小明",
+    username="ming",
+    user_id=7,
+    text="",
+    media="",
+    date=SENT_AT,
+    images=None,
+    reply_to_id=None,
+    reply_to=None,
+    quote="",
 ) -> ChatMessage:
     return ChatMessage(
         id=id,
@@ -296,6 +320,9 @@ def chat_message(
         content=Content(text=text, media=media),
         date=date,
         images=list(images or []),
+        reply_to_id=reply_to_id,
+        reply_to=reply_to,
+        quote=quote,
     )
 
 
