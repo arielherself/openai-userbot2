@@ -289,42 +289,81 @@ async def images_of(client, message, budget: int = MAX_IMAGES_BYTES) -> list[str
 
     A photo is its own picture; a document is one when it is an image, and
     otherwise contributes its thumbnail, which is how a video, a video note, an
-    animation or a video sticker gives up a frame. Anything else has no picture,
-    and nothing here is worth failing a turn over: a download that goes wrong
-    simply leaves a placeholder in the prompt.
+    animation or a video sticker gives up a frame. The Instant View of a link the
+    message carries is read by the same rules and its media travels too, a video
+    in it giving up its thumbnail as well. Anything else has no picture, and
+    nothing here is worth failing a turn over: a download that goes wrong simply
+    leaves a placeholder in the prompt.
     """
-    kind, thumb, mime = image_source(message)
-    if kind == "none":
+    wanted = [(message, *image_source(getattr(message, "media", None)))]
+    wanted += [(media, *image_source(media)) for media in page_media(message)]
+    images: list[str] = []
+    left = budget
+    for target, kind, thumb, mime in wanted:
+        if len(images) >= MAX_IMAGES:
+            break
+        if kind == "none":
+            continue
+        image = await _fetched_image(client, target, kind, thumb, mime, left)
+        if image:
+            images.append(image)
+            left -= len(image)
+    return images
+
+
+def page_media(message) -> list:
+    """The media of a message's Instant View page, as Telegram holds it.
+
+    A page keeps the photos and videos its blocks show beside it, as plain
+    `Photo` and `Document` objects — the same media a message carries, so the
+    same rules decide which of them become pictures. A link Telegram has not
+    cached a page for has none.
+    """
+    page = getattr(getattr(message, "web_preview", None), "cached_page", None)
+    if page is None:
         return []
+    return [*(page.photos or []), *(page.documents or [])]
+
+
+async def _fetched_image(
+    client, target, kind: str, thumb: int | None, mime: str, budget: int
+) -> str:
+    """One picture as a `data:` URI, or "" when it cannot be had."""
     try:
         handle = await client.download_media(
-            message, file=io.BytesIO(), thumb=thumb if kind == "thumb" else None
+            target, file=io.BytesIO(), thumb=thumb if kind == "thumb" else None
         )
     except Exception:
-        return []
+        return ""
     raw = handle.getvalue() if handle is not None else b""
     if not raw or len(raw) > MAX_IMAGE_BYTES:
-        return []
+        return ""
     encoded = base64.b64encode(raw).decode("ascii")
-    if len(encoded) > budget:
-        return []
-    return [f"data:{mime};base64,{encoded}"]
+    uri = f"data:{mime};base64,{encoded}"
+    if len(uri) > budget:
+        return ""
+    return uri
 
 
-def image_source(message) -> tuple[str, int | None, str]:
-    """What picture a message holds: `("file"|"thumb"|"none", size index, mime)`."""
-    media = getattr(message, "media", None)
+def image_source(media) -> tuple[str, int | None, str]:
+    """What picture a piece of media holds: `("file"|"thumb"|"none", size, mime)`.
+
+    A message's media and an Instant View page's media are judged alike: a photo
+    is fetched at a size worth reading, an image file whole, and anything else
+    gives up the widest thumbnail it has.
+    """
     if isinstance(media, types.MessageMediaPhoto):
-        if media.photo is None:
-            return "none", None, ""
-        return "thumb", best_size(getattr(media.photo, "sizes", None)), "image/jpeg"
-    if not isinstance(media, types.MessageMediaDocument) or media.document is None:
+        media = media.photo
+    if isinstance(media, types.Photo):
+        return "thumb", best_size(media.sizes), "image/jpeg"
+    if isinstance(media, types.MessageMediaDocument):
+        media = media.document
+    if not isinstance(media, types.Document):
         return "none", None, ""
-    document = media.document
-    mime = document.mime_type or ""
+    mime = media.mime_type or ""
     if mime.startswith("image/"):
         return "file", None, mime
-    thumb = best_size(document.thumbs)
+    thumb = best_size(media.thumbs)
     if thumb is None:
         return "none", None, ""
     return "thumb", thumb, "image/jpeg"

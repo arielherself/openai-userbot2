@@ -12,6 +12,7 @@ from telethon.tl.custom import Message as TgMessage
 
 from userbot.telegram import (
     MAX_IMAGE_BYTES,
+    MAX_IMAGES,
     TelethonDelivery,
     as_markdown,
     best_size,
@@ -54,7 +55,7 @@ class StubClient:
     BYTES = b"\xff\xd8\xff\xe0image bytes"
 
     async def download_media(self, message, file=None, thumb=None):
-        self.downloaded.append({"thumb": thumb})
+        self.downloaded.append({"message": message, "thumb": thumb})
         if self.fail_download:
             raise RuntimeError("telegram said no")
         file.write(self.payload if self.payload is not None else self.BYTES)
@@ -261,13 +262,13 @@ def test_a_photo_is_fetched_at_a_size_worth_reading():
     assert best_size(big) == 0
 
 
-def test_what_a_message_offers_as_a_picture():
+def test_what_a_piece_of_media_offers_as_a_picture():
     photo = types.MessageMediaPhoto(
         photo=types.Photo(
             id=1, access_hash=1, file_reference=b"", date=None, dc_id=2, sizes=photo_sizes()
         )
     )
-    assert image_source(message(media=photo)) == ("thumb", 3, "image/jpeg")
+    assert image_source(photo) == ("thumb", 3, "image/jpeg")
 
     picture = types.MessageMediaDocument(
         document=types.Document(
@@ -281,7 +282,7 @@ def test_what_a_message_offers_as_a_picture():
             attributes=[types.DocumentAttributeFilename(file_name="cat.png")],
         )
     )
-    assert image_source(message(media=picture)) == ("file", None, "image/png")
+    assert image_source(picture) == ("file", None, "image/png")
 
     video = types.MessageMediaDocument(
         document=types.Document(
@@ -296,11 +297,15 @@ def test_what_a_message_offers_as_a_picture():
             thumbs=[types.PhotoSize(type="m", w=320, h=180, size=50)],
         )
     )
-    assert image_source(message(media=video)) == ("thumb", 0, "image/jpeg")
-    assert image_source(message(id=6, text="just words")) == ("none", None, "")
+    assert image_source(video) == ("thumb", 0, "image/jpeg")
+    assert image_source(None) == ("none", None, "")
+    # an Instant View page hands over bare photos and documents: same judgement
+    assert image_source(photo.photo) == ("thumb", 3, "image/jpeg")
+    assert image_source(picture.document) == ("file", None, "image/png")
+    assert image_source(video.document) == ("thumb", 0, "image/jpeg")
 
 
-def test_a_message_with_a_video_but_no_thumbnail_has_no_picture():
+def test_a_video_without_a_thumbnail_has_no_picture():
     video = types.MessageMediaDocument(
         document=types.Document(
             id=2,
@@ -313,7 +318,8 @@ def test_a_message_with_a_video_but_no_thumbnail_has_no_picture():
             attributes=[types.DocumentAttributeVideo(duration=9, w=1920, h=1080)],
         )
     )
-    assert image_source(message(media=video))[0] == "none"
+    assert image_source(video)[0] == "none"
+    assert image_source(video.document)[0] == "none"
 
 
 def test_the_bytes_are_encoded_as_a_data_uri():
@@ -331,12 +337,13 @@ def test_the_bytes_are_encoded_as_a_data_uri():
                 attributes=[],
             )
         )
-        images = await images_of(client, message(media=picture))
+        sent = message(media=picture)
+        images = await images_of(client, sent)
         assert len(images) == 1
         assert images[0].startswith("data:image/png;base64,")
         assert base64.b64decode(images[0].split(",", 1)[1]) == StubClient.BYTES
         # an image document is fetched whole; a photo's thumb is picked by index
-        assert client.downloaded == [{"thumb": None}]
+        assert client.downloaded == [{"message": sent, "thumb": None}]
 
     asyncio.run(scenario())
 
@@ -363,5 +370,162 @@ def test_an_image_that_is_too_big_or_unreachable_is_left_out():
 
         broken = StubClient(fail=True)
         assert await images_of(broken, message(media=picture)) == []
+
+    asyncio.run(scenario())
+
+
+# --- a link's Instant View ---------------------------------------------------
+
+
+def page_photo(id=7):
+    """A photo the way an Instant View page holds it — no message around it."""
+    return types.Photo(
+        id=id, access_hash=1, file_reference=b"", date=None, dc_id=2, sizes=photo_sizes()
+    )
+
+
+def page_video(id=8, thumbs=None):
+    """A video the way an Instant View page holds it."""
+    if thumbs is None:
+        thumbs = [types.PhotoSize(type="m", w=320, h=180, size=50)]
+    return types.Document(
+        id=id,
+        access_hash=1,
+        file_reference=b"",
+        date=None,
+        dc_id=2,
+        mime_type="video/mp4",
+        size=10,
+        attributes=[types.DocumentAttributeVideo(duration=9, w=1920, h=1080)],
+        thumbs=thumbs,
+    )
+
+
+def link_message(photos=(), documents=()):
+    """A message that is a link, with the page Telegram cached for it."""
+    webpage = types.WebPage(
+        id=1,
+        url="https://example.com/how",
+        display_url="example.com/how",
+        hash=0x8B1D2F0A1E5C8D3B,
+        site_name="Example",
+        title="How X works",
+        description="",
+        cached_page=types.Page(
+            url="https://example.com/how",
+            blocks=[],
+            photos=list(photos),
+            documents=list(documents),
+        ),
+    )
+    return message(media=types.MessageMediaWebPage(webpage=webpage))
+
+
+def test_an_instant_views_photo_travels_with_the_message():
+    async def scenario():
+        client = StubClient()
+        cached = page_photo()
+        images = await images_of(client, link_message(photos=[cached]))
+        assert len(images) == 1
+        assert images[0].startswith("data:image/jpeg;base64,")
+        # the page's photo gets the same readable size a message's photo gets
+        assert client.downloaded == [{"message": cached, "thumb": 3}]
+
+    asyncio.run(scenario())
+
+
+def test_an_image_file_in_an_instant_view_is_fetched_whole():
+    async def scenario():
+        client = StubClient()
+        picture = types.Document(
+            id=11,
+            access_hash=1,
+            file_reference=b"",
+            date=None,
+            dc_id=2,
+            mime_type="image/png",
+            size=10,
+            attributes=[],
+            thumbs=[],
+        )
+        images = await images_of(client, link_message(documents=[picture]))
+        assert len(images) == 1
+        assert images[0].startswith("data:image/png;base64,")
+        assert client.downloaded == [{"message": picture, "thumb": None}]
+
+    asyncio.run(scenario())
+
+
+def test_a_video_in_an_instant_view_gives_up_its_thumbnail():
+    async def scenario():
+        client = StubClient()
+        video = page_video()
+        images = await images_of(client, link_message(documents=[video]))
+        assert len(images) == 1
+        assert client.downloaded == [{"message": video, "thumb": 0}]
+
+    asyncio.run(scenario())
+
+
+def test_an_instant_view_file_that_is_no_picture_is_left_alone():
+    async def scenario():
+        client = StubClient()
+        report = types.Document(
+            id=10,
+            access_hash=1,
+            file_reference=b"",
+            date=None,
+            dc_id=2,
+            mime_type="application/pdf",
+            size=10,
+            attributes=[],
+            thumbs=[],
+        )
+        assert await images_of(client, link_message(documents=[report])) == []
+        # nor does a video whose thumbnail Telegram will not give
+        assert await images_of(client, link_message(documents=[page_video(thumbs=[])])) == []
+        assert client.downloaded == []
+
+    asyncio.run(scenario())
+
+
+def test_a_link_telegram_cached_no_page_for_has_no_pictures():
+    async def scenario():
+        client = StubClient()
+        plain = types.WebPage(
+            id=1,
+            url="https://example.com/how",
+            display_url="example.com/how",
+            hash=1,
+            site_name="Example",
+            title="How X works",
+            description="",
+        )
+        sent = message(media=types.MessageMediaWebPage(webpage=plain))
+        assert await images_of(client, sent) == []
+        assert client.downloaded == []
+
+    asyncio.run(scenario())
+
+
+def test_a_page_never_hands_over_more_pictures_than_a_fork_carries():
+    async def scenario():
+        client = StubClient()
+        photos = [page_photo(id=index) for index in range(1, MAX_IMAGES + 3)]
+        images = await images_of(client, link_message(photos=photos))
+        assert len(images) == MAX_IMAGES
+        assert [entry["message"] for entry in client.downloaded] == photos[:MAX_IMAGES]
+
+    asyncio.run(scenario())
+
+
+def test_the_pictures_of_a_page_share_one_budget():
+    async def scenario():
+        # the first fits in what is left of the budget, the second does not
+        client = StubClient(payload=b"x" * 300)
+        pictures = [page_photo(1), page_photo(2)]
+        images = await images_of(client, link_message(photos=pictures), budget=500)
+        assert len(images) == 1
+        assert len(client.downloaded) == 2  # the second was tried, then dropped
 
     asyncio.run(scenario())

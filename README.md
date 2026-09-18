@@ -276,6 +276,11 @@ three things:
 - a message read with `tg_read_message`, which is why its description says the
   pictures come back with it.
 
+A link is read the same way when Telegram cached an **Instant View** for it: the
+page's own media is judged like a message's media — its photos, the pictures sent
+as files, and a frame of each video it holds — and travels with the message that
+carries the link.
+
 Everything else keeps the placeholder: the history the view tools print stays
 text, and so does a message whose picture Telegram will not hand over. At most
 four pictures ride along, each capped at 3 MiB and the lot at 5 MiB of base64,

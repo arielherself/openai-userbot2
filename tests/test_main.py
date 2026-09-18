@@ -336,3 +336,65 @@ def test_an_anonymous_post_with_a_picture_reaches_the_agent():
 
     assert incoming.sender_name == "anonymous admin" and incoming.sender_id is None
     assert incoming.images and incoming.images[0].startswith("data:image/jpeg;base64,")
+
+
+def test_an_instant_view_reaches_the_agent_with_its_pictures():
+    """A link's page is read the way the message's own media is."""
+    page = types.Page(
+        url="https://example.com/how",
+        blocks=[types.PageBlockPhoto(photo_id=1, caption=types.TextPlain("图注"))],
+        photos=[photo()],
+        documents=[],
+    )
+    link = types.WebPage(
+        id=1,
+        url="https://example.com/how",
+        display_url="example.com/how",
+        hash=0x8B1D2F0A1E5C8D3B,
+        site_name="Example",
+        title="How X works",
+        description="A short summary.",
+        cached_page=page,
+    )
+    files = FakeFiles()
+    incoming = build(FakeEvent(FakeMessage(text="@MyBot 看看这个链接", webpage=link), client=files))
+
+    assert incoming.images and incoming.images[0].startswith("data:image/jpeg;base64,")
+    assert "[instant view content]" in incoming.content.media
+    # the page's own photo is what was fetched, not anything of the message
+    assert files.asked == [{"message": page.photos[0], "thumb": 0}]
+
+
+def test_a_reply_to_an_anonymous_admin_is_quoted():
+    """The hidden sender says nothing about the quote: it is a message like any."""
+    header = types.MessageReplyHeader(
+        reply_to_msg_id=999, reply_to_peer_id=types.PeerChannel(channel_id=99)
+    )
+    hidden = tg_message(id=999, text="匿名管理员说的话", peer=None, media=picture())
+    hidden._sender = None
+
+    incoming = build(
+        FakeEvent(FakeMessage(text="@MyBot 这句什么意思？", reply_to=header, reply=hidden))
+    )
+    assert incoming.quoted is not None
+    assert incoming.quoted.content.text == "匿名管理员说的话"
+    assert incoming.quoted.sender_name == "anonymous admin"
+    assert incoming.quoted.sender_id is None and incoming.quoted.sender_username is None
+    assert incoming.quoted.images and incoming.quoted.images[0].startswith("data:image/jpeg")
+
+    prompt = build_prompt(incoming)
+    assert "replying to anonymous admin:" in prompt
+    assert "匿名管理员说的话" in prompt
+
+
+def test_a_reply_to_our_own_anonymous_post_is_a_continuation():
+    """A post the userbot made through an anonymous admin alias is still ours."""
+    header = types.MessageReplyHeader(
+        reply_to_msg_id=1000, reply_to_peer_id=types.PeerChannel(channel_id=99)
+    )
+    ours = tg_message(id=1000, text="我们自己发的", peer=None, out=True)
+    ours._sender = None
+
+    incoming = build(FakeEvent(FakeMessage(text="继续说", reply_to=header, reply=ours)))
+    assert incoming.reply_to_message_id == 1000
+    assert incoming.quoted is None  # not quoted back at us: it is our own message

@@ -438,3 +438,28 @@ def test_reading_one_message_shows_what_it_answers():
         assert answer.result.endswith("火锅吧")
 
     asyncio.run(scenario())
+
+
+def test_a_reply_to_an_anonymous_admin_reads_as_a_conversation():
+    async def scenario():
+        delivery = FakeTelegram()
+        delivery.chats[-100] = chat_view(
+            chat_id=-100,
+            messages=[
+                chat_message(
+                    id=41,
+                    name="anonymous admin",
+                    username=None,
+                    user_id=None,
+                    text="群规看这里",
+                ),
+                chat_message(id=42, text="收到", reply_to_id=41),
+            ],
+        )
+
+        answer = await history.current_chat(delivery, -100)
+        assert "↩ in reply to [41] anonymous admin: 群规看这里\n收到" in answer.result
+        # the anonymous entry names itself and invents no id
+        assert "1. [41] 2026-09-18 12:12 +0800 anonymous admin:" in answer.result
+
+    asyncio.run(scenario())
