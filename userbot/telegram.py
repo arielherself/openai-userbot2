@@ -330,14 +330,15 @@ async def images_of(client, message, budget: int = MAX_IMAGES_BYTES) -> list[str
 
     A photo is its own picture; a document is one when it is an image, and
     otherwise contributes its thumbnail, which is how a video, a video note, an
-    animation or a video sticker gives up a frame. The Instant View of a link the
-    message carries is read by the same rules and its media travels too, a video
-    in it giving up its thumbnail as well. Anything else has no picture, and
-    nothing here is worth failing a turn over: a download that goes wrong simply
-    leaves a placeholder in the prompt.
+    animation or a video sticker gives up a frame. A link the message carries is
+    read by the same rules and its media travels too — the preview's own picture
+    or video first, then an Instant View page's when Telegram cached one — a
+    video in either giving up its thumbnail as well. Anything else has no
+    picture, and nothing here is worth failing a turn over: a download that goes
+    wrong simply leaves a placeholder in the prompt.
     """
     wanted = [(message, *image_source(getattr(message, "media", None)))]
-    wanted += [(media, *image_source(media)) for media in page_media(message)]
+    wanted += [(media, *image_source(media)) for media in link_media(message)]
     images: list[str] = []
     left = budget
     for target, kind, thumb, mime in wanted:
@@ -352,18 +353,24 @@ async def images_of(client, message, budget: int = MAX_IMAGES_BYTES) -> list[str
     return images
 
 
-def page_media(message) -> list:
-    """The media of a message's Instant View page, as Telegram holds it.
+def link_media(message) -> list:
+    """The media a message's link holds: the preview's own, and its page's.
 
-    A page keeps the photos and videos its blocks show beside it, as plain
-    `Photo` and `Document` objects — the same media a message carries, so the
-    same rules decide which of them become pictures. A link Telegram has not
-    cached a page for has none.
+    Telegram keeps a preview's picture or video on the webpage itself, and beside
+    a cached Instant View page the article's photos and videos — plain `Photo`
+    and `Document` objects either way, the same media a message carries, so the
+    same rules decide which of them become pictures. The preview comes first: it
+    is what the message itself shows. A link Telegram neither previewed nor
+    cached a page for contributes nothing.
     """
-    page = getattr(getattr(message, "web_preview", None), "cached_page", None)
-    if page is None:
+    webpage = getattr(message, "web_preview", None)
+    if webpage is None:
         return []
-    return [*(page.photos or []), *(page.documents or [])]
+    media = [getattr(webpage, "photo", None), getattr(webpage, "document", None)]
+    page = getattr(webpage, "cached_page", None)
+    if page is not None:
+        media += [*(page.photos or []), *(page.documents or [])]
+    return [entry for entry in media if entry is not None]
 
 
 async def _fetched_image(

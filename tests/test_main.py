@@ -276,6 +276,30 @@ def test_a_picture_in_the_message_and_in_the_quote_comes_along():
     assert incoming.quoted.images == incoming.images  # the same picture, twice asked for
 
 
+def test_a_links_preview_picture_reaches_the_agent_too():
+    webpage = types.WebPage(
+        id=1,
+        url="https://example.com/how",
+        display_url="example.com/how",
+        hash=1,
+        site_name="Example",
+        title="How X works",
+        description="",
+        photo=photo(),
+    )
+    files = FakeFiles()
+    incoming = build(
+        FakeEvent(
+            FakeMessage(text="@MyBot 看这个 https://example.com/how", webpage=webpage),
+            client=files,
+        )
+    )
+
+    assert incoming.images and incoming.images[0].startswith("data:image/jpeg;base64,")
+    # the preview's own photo is what was fetched, at the size a message's gets
+    assert files.asked == [{"message": webpage.photo, "thumb": 0}]
+
+
 def test_a_message_without_a_picture_carries_none():
     incoming = build(FakeEvent(FakeMessage(text="就一句话")))
     assert incoming.images == []

@@ -300,10 +300,11 @@ three things:
 - a message read with `tg_read_message`, which is why its description says the
   pictures come back with it.
 
-A link is read the same way when Telegram cached an **Instant View** for it: the
-page's own media is judged like a message's media — its photos, the pictures sent
-as files, and a frame of each video it holds — and travels with the message that
-carries the link.
+A link is read the same way. The **preview**'s own picture or video is judged like
+a message's media — a video giving up its thumbnail — and so is the media of a
+cached **Instant View** page: its photos, the pictures sent as files, and a frame
+of each video it holds. The preview comes first, and all of it travels with the
+message that carries the link.
 
 Everything else keeps the placeholder: the history the view tools print stays
 text, and so does a message whose picture Telegram will not hand over. At most

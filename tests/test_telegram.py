@@ -445,7 +445,7 @@ def test_an_image_that_is_too_big_or_unreachable_is_left_out():
     asyncio.run(scenario())
 
 
-# --- a link's Instant View ---------------------------------------------------
+# --- a link's preview and Instant View ----------------------------------------
 
 
 def page_photo(id=7):
@@ -472,8 +472,21 @@ def page_video(id=8, thumbs=None):
     )
 
 
-def link_message(photos=(), documents=()):
-    """A message that is a link, with the page Telegram cached for it."""
+def link_message(photos=(), documents=(), photo=None, document=None, cached=True):
+    """A message that is a link, with what Telegram holds for it.
+
+    `photo`/`document` are the preview's own media; `photos`/`documents` the ones
+    beside the cached Instant View page. `cached=False` leaves the page out, the
+    way a link Telegram has no Instant View for arrives.
+    """
+    page = None
+    if cached:
+        page = types.Page(
+            url="https://example.com/how",
+            blocks=[],
+            photos=list(photos),
+            documents=list(documents),
+        )
     webpage = types.WebPage(
         id=1,
         url="https://example.com/how",
@@ -482,12 +495,9 @@ def link_message(photos=(), documents=()):
         site_name="Example",
         title="How X works",
         description="",
-        cached_page=types.Page(
-            url="https://example.com/how",
-            blocks=[],
-            photos=list(photos),
-            documents=list(documents),
-        ),
+        photo=photo,
+        document=document,
+        cached_page=page,
     )
     return message(media=types.MessageMediaWebPage(webpage=webpage))
 
@@ -560,20 +570,66 @@ def test_an_instant_view_file_that_is_no_picture_is_left_alone():
     asyncio.run(scenario())
 
 
-def test_a_link_telegram_cached_no_page_for_has_no_pictures():
+def test_a_link_previews_own_photo_travels_with_the_message():
     async def scenario():
         client = StubClient()
-        plain = types.WebPage(
-            id=1,
-            url="https://example.com/how",
-            display_url="example.com/how",
-            hash=1,
-            site_name="Example",
-            title="How X works",
-            description="",
+        preview = page_photo()
+        images = await images_of(client, link_message(photo=preview, cached=False))
+        assert len(images) == 1
+        assert images[0].startswith("data:image/jpeg;base64,")
+        # the preview's photo gets the same readable size a message's photo gets
+        assert client.downloaded == [{"message": preview, "thumb": 3}]
+
+    asyncio.run(scenario())
+
+
+def test_an_image_file_in_a_link_preview_is_fetched_whole():
+    async def scenario():
+        client = StubClient()
+        picture = types.Document(
+            id=11,
+            access_hash=1,
+            file_reference=b"",
+            date=None,
+            dc_id=2,
+            mime_type="image/png",
+            size=10,
+            attributes=[],
+            thumbs=[],
         )
-        sent = message(media=types.MessageMediaWebPage(webpage=plain))
-        assert await images_of(client, sent) == []
+        images = await images_of(client, link_message(document=picture, cached=False))
+        assert len(images) == 1
+        assert images[0].startswith("data:image/png;base64,")
+        assert client.downloaded == [{"message": picture, "thumb": None}]
+
+    asyncio.run(scenario())
+
+
+def test_a_video_in_a_link_preview_gives_up_its_thumbnail():
+    async def scenario():
+        client = StubClient()
+        video = page_video()
+        images = await images_of(client, link_message(document=video, cached=False))
+        assert len(images) == 1
+        assert client.downloaded == [{"message": video, "thumb": 0}]
+
+    asyncio.run(scenario())
+
+
+def test_a_link_preview_that_holds_no_picture_contributes_nothing():
+    async def scenario():
+        client = StubClient()
+        # a preview video whose thumbnail Telegram will not give is no picture
+        assert await images_of(client, link_message(document=page_video(thumbs=[]))) == []
+        assert client.downloaded == []
+
+    asyncio.run(scenario())
+
+
+def test_a_link_with_neither_a_preview_picture_nor_a_page_has_none():
+    async def scenario():
+        client = StubClient()
+        assert await images_of(client, link_message(cached=False)) == []
         assert client.downloaded == []
 
     asyncio.run(scenario())
@@ -590,12 +646,40 @@ def test_a_page_never_hands_over_more_pictures_than_a_fork_carries():
     asyncio.run(scenario())
 
 
+def test_a_previews_picture_comes_before_the_pages_and_shares_their_cap():
+    async def scenario():
+        client = StubClient()
+        preview = page_photo(id=99)
+        photos = [page_photo(id=index) for index in range(1, MAX_IMAGES + 2)]
+        images = await images_of(client, link_message(photo=preview, photos=photos))
+        assert len(images) == MAX_IMAGES
+        assert [entry["message"] for entry in client.downloaded] == [
+            preview,
+            *photos[: MAX_IMAGES - 1],
+        ]
+
+    asyncio.run(scenario())
+
+
 def test_the_pictures_of_a_page_share_one_budget():
     async def scenario():
         # the first fits in what is left of the budget, the second does not
         client = StubClient(payload=b"x" * 300)
         pictures = [page_photo(1), page_photo(2)]
         images = await images_of(client, link_message(photos=pictures), budget=500)
+        assert len(images) == 1
+        assert len(client.downloaded) == 2  # the second was tried, then dropped
+
+    asyncio.run(scenario())
+
+
+def test_a_preview_and_a_page_share_one_budget():
+    async def scenario():
+        # the preview fits in what the budget allows; the page's picture does not
+        client = StubClient(payload=b"x" * 300)
+        images = await images_of(
+            client, link_message(photo=page_photo(1), photos=[page_photo(2)]), budget=500
+        )
         assert len(images) == 1
         assert len(client.downloaded) == 2  # the second was tried, then dropped
 
