@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass, field
 
 from .content import Content, Quoted
@@ -148,6 +149,13 @@ def _short(text, limit: int = 200) -> str:
     return flat if len(flat) <= limit else flat[: limit - 1] + "…"
 
 
+def is_inspect(message: Incoming) -> bool:
+    """Whether this is `/inspect` aimed at one of our messages."""
+    if message.reply_to_message_id is None:
+        return False
+    return message.content.text.strip().lower().startswith("/inspect")
+
+
 def _music_arguments(arguments: dict, field: str) -> tuple[str, str, str | None]:
     """The platform and the text a music tool was given, or what is wrong with them."""
     platform = resolve_platform(arguments.get("platform"))
@@ -183,8 +191,10 @@ class _Turn:
 
     message: Incoming
     block: str
+    parent: str
     status: TurnStatus
     tracker: StatusMessage
+    started: float = 0.0
     sent: list[int] = field(default_factory=list)
     delivered: bool = False
     # What a rollback would have to delete, per local call: the messages a call
@@ -213,10 +223,15 @@ class Bridge:
         self.identity = identity
         # one gate for the whole userbot: the music bot is shared between chats
         self.music_gate = music_gate if music_gate is not None else Gate()
+        # the turns running right now, by block, for `/inspect` to look at
+        self._turns: dict[str, _Turn] = {}
 
     # --- entry point --------------------------------------------------------
     async def handle(self, message: Incoming) -> None:
         """Answer one message, if it is addressed to us. Never raises."""
+        if is_inspect(message):
+            await self._inspect(message)
+            return
         try:
             parent = await self._parent(message)
         except Exception as error:
@@ -230,14 +245,43 @@ class Bridge:
             return
         block = None
         try:
-            block = await self._fork(message, parent)
-            await self._turn(message, block)
+            block, forked_from = await self._fork(message, parent)
+            await self._turn(message, block, forked_from)
         except HarnessError as error:
             log.warning("the harness refused the turn for %s: %s", message.message_id, error)
             await self._failure(message, block, str(error))
         except Exception as error:
             log.exception("the turn for %s broke", message.message_id)
             await self._failure(message, block, f"internal error: {error}")
+
+    async def _inspect(self, message: Incoming) -> None:
+        """Answer `/inspect`: what the turn behind the replied-to message is doing."""
+        block = self.store.lookup(message.chat_id, message.reply_to_message_id)
+        if block is None:
+            return  # a message we never sent: not ours to explain
+        log.info("inspecting %s for chat %s", block, message.chat_id)
+        sent = await self.delivery.send(
+            message.chat_id, self._inspection(block), reply_to=message.message_id
+        )
+        # the answer is a message of ours like any other: it can be asked about too
+        self.store.record(message.chat_id, sent, block)
+
+    def _inspection(self, block: str) -> str:
+        """Everything known about a block's turn, with nothing clipped."""
+        turn = self._turns.get(block)
+        if turn is None:
+            return f"🔍 {block}\n\nno turn of mine is running for that block any more"
+        elapsed = time.monotonic() - turn.started
+        state = [
+            f"chat {turn.message.chat_id}",
+            f"asked in message {turn.message.message_id}",
+            f"forked from {turn.parent}",
+            f"reply sent as {len(turn.sent)} message(s)"
+            if turn.delivered
+            else "reply not sent yet",
+            f"{elapsed:.0f}s in",
+        ]
+        return "\n".join([f"🔍 {block}", "", turn.status.detail(), "", " · ".join(state)])
 
     # --- choosing where the turn forks from ----------------------------------
     async def _parent(self, message: Incoming) -> str | None:
@@ -274,7 +318,7 @@ class Bridge:
         log.info("chat %s now starts conversations at %s", chat_id, root)
         return root
 
-    async def _fork(self, message: Incoming, parent: str) -> str:
+    async def _fork(self, message: Incoming, parent: str) -> tuple[str, str]:
         block = new_agent_id("tg")
         prompt = build_prompt(message, self.identity)
         fields = {
@@ -296,7 +340,7 @@ class Bridge:
             del fields["images"]
         try:
             await self.hh.command(**fields)
-            return block
+            return block, parent
         except HarnessError as error:
             if error.code != "unknown_agent":
                 raise
@@ -306,20 +350,28 @@ class Bridge:
             log.warning("the harness no longer knows %s; opening a new conversation", parent)
             fields["id"] = await self._chat_root(message.chat_id, refresh=True)
             await self.hh.command(**fields)
-            return block
+            return block, fields["id"]
 
     # --- running the turn ----------------------------------------------------
-    async def _turn(self, message: Incoming, block: str) -> None:
+    async def _turn(self, message: Incoming, block: str, parent: str) -> None:
         turn = _Turn(
             message=message,
             block=block,
+            parent=parent,
             status=TurnStatus(),
             tracker=StatusMessage(
-                self.delivery, message.chat_id, message.message_id, self.status_interval
+                self.delivery,
+                message.chat_id,
+                message.message_id,
+                self.status_interval,
+                store=self.store,
+                block=block,
             ),
+            started=time.monotonic(),
         )
         status = turn.status
         failure: str | None = None
+        self._turns[block] = turn
         subscription = self.hh.subscribe(f"agent:{block}")
         try:
             rid = self.hh.next_rid()
@@ -389,6 +441,7 @@ class Bridge:
                     break
         finally:
             subscription.close()
+            self._turns.pop(block, None)
 
         if failure is not None:
             status.phase = "failed"

@@ -82,6 +82,14 @@ class TurnStatus:
         """
         return bool(self.reasoning or self.content or self.tools)
 
+    def detail(self) -> str:
+        """The same facts as `render`, with nothing clipped — for `/inspect`."""
+        lines = [self.render()]
+        for tool in self.tools:
+            if tool.state == "failed" and tool.detail:
+                lines.append(f"❌ {tool.name}: {tool.detail}")
+        return "\n".join(lines)
+
     def render(self) -> str:
         headline = HEADLINES.get(self.phase, THINKING)
         body = []
@@ -105,7 +113,12 @@ class TurnStatus:
 
 
 class StatusMessage:
-    """Posts the status once the first thing worth showing happens, then edits it."""
+    """Posts the status once the first thing worth showing happens, then edits it.
+
+    While it stands, the message is recorded against the block it is tracking, so
+    that a reply to it can ask what the turn is doing (`/inspect`). That mapping
+    is temporary like the message: deleting the message drops it.
+    """
 
     def __init__(
         self,
@@ -113,11 +126,15 @@ class StatusMessage:
         chat_id: int,
         reply_to: int,
         min_interval: float = 2.0,
+        store=None,
+        block: str | None = None,
     ) -> None:
         self.delivery = delivery
         self.chat_id = chat_id
         self.reply_to = reply_to
         self.min_interval = min_interval
+        self.store = store
+        self.block = block
         self.message_id: int | None = None
         self.deleted = False
         self._text: str | None = None
@@ -144,6 +161,7 @@ class StatusMessage:
                 log.warning("could not post the status message: %s", error)
                 self.deleted = True  # do not keep retrying into a failing chat
                 return
+            self._remember()
             self._text, self._at = text, time.monotonic()
             return
         now = time.monotonic()
@@ -157,12 +175,19 @@ class StatusMessage:
             return
         self._text, self._at = text, now
 
+    def _remember(self) -> None:
+        """Point the tracking message at the block whose turn it is tracking."""
+        if self.store is not None and self.block and self.message_id is not None:
+            self.store.record(self.chat_id, self.message_id, self.block)
+
     async def delete(self) -> None:
         """Take the status message down — the reply itself is the answer now."""
         message_id, self.message_id = self.message_id, None
         self.deleted = True
         if message_id is None:
             return
+        if self.store is not None:
+            self.store.forget(self.chat_id, [message_id])
         try:
             await self.delivery.delete(self.chat_id, [message_id])
         except Exception as error:

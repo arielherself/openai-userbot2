@@ -630,7 +630,9 @@ def test_a_turn_that_ends_without_a_reply_says_so(tmp_path):
         try:
             assert len(delivery.sent) == 1  # the status message, still standing
             assert "no reply was drafted" in delivery.edits[-1]["text"]
-            assert store.count() == 0
+            # the tracking message is mapped while it stands, and nothing else is
+            assert store.lookup(-100, delivery.sent[0]["id"]) is not None
+            assert store.count() == 1
         finally:
             store.close()
 
@@ -645,7 +647,7 @@ def test_a_draft_without_details_is_refused(tmp_path):
         try:
             assert len(delivery.sent) == 1  # nothing but the status message
             assert "error" in agent.resolved[-1]
-            assert store.count() == 0
+            assert store.count() == 1  # just the tracking message's own mapping
         finally:
             store.close()
 
@@ -1294,6 +1296,102 @@ def test_a_mention_in_a_draft_goes_out_without_pinging_anyone(tmp_path):
             assert reply["text"] == "回复 #小明\n\n也可以问 #channel"
             assert bold_of(reply) == ["#channel"]
         finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+async def while_a_turn_runs(tmp_path, hold):
+    """Start a turn that is stuck inside a tool, so it can be inspected."""
+    agent = ScriptedAgent(
+        calls=[
+            ("tg_view_current_chat", {}),
+            ("tg_draft_response", {"summary": "s", "details": "d"}),
+        ]
+    )
+    harness = await FakeHarness(agent).start()
+    client = HHClient(harness.host, harness.port)
+    await client.connect()
+    delivery = FakeTelegram()
+    delivery.hold = hold
+    delivery.chats[-100] = chat_view(chat_id=-100, messages=[chat_message(id=41, text="很久以前")])
+    store = MappingStore(str(tmp_path / "mappings.db"))
+    bridge = Bridge(client, store, delivery, status_interval=0.0)
+    turn = asyncio.create_task(bridge.handle(mention()))
+    for _ in range(200):  # wait for the tracking message to go up
+        if delivery.sent:
+            break
+        await asyncio.sleep(0.005)
+    return agent, harness, client, delivery, store, bridge, turn
+
+
+def test_a_tracking_message_can_be_inspected_while_the_turn_runs(tmp_path):
+    async def scenario():
+        hold = asyncio.Event()
+        _, harness, client, delivery, store, bridge, turn = await while_a_turn_runs(tmp_path, hold)
+        try:
+            tracking = delivery.sent[0]
+            block = harness.commands_named("fork")[0]["new_id"]
+            assert store.lookup(-100, tracking["id"]) == block
+
+            await bridge.handle(reply_to(to=tracking["id"], text="/inspect"))
+            printed = delivery.sent[-1]["text"]
+            assert printed.startswith(f"🔍 {block}")
+            assert "🔧 calling tg_view_current_chat" in printed
+            assert "asked in message 50" in printed
+            assert "forked from" in printed and "reply not sent yet" in printed
+            # the answer is ours too, and no new turn was started for it
+            assert store.lookup(-100, delivery.sent[-1]["id"]) == block
+            assert len(harness.commands_named("fork")) == 1
+
+            hold.set()
+            await turn
+            # once the reply went out the tracking message is gone, mapping and all
+            assert store.lookup(-100, tracking["id"]) is None
+            assert delivery.deleted[-1] == (-100, (tracking["id"],))
+        finally:
+            hold.set()
+            await client.close()
+            await harness.stop()
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_inspecting_says_so_when_nothing_is_running(tmp_path):
+    async def scenario():
+        hold = asyncio.Event()
+        hold.set()  # nothing is held open this time
+        _, harness, client, delivery, store, bridge, turn = await while_a_turn_runs(tmp_path, hold)
+        try:
+            await turn  # let the turn finish first
+            answer = [one for one in delivery.live() if one["chat_id"] == -100][-1]
+            await bridge.handle(reply_to(to=answer["id"], text="/inspect"))
+            printed = delivery.sent[-1]["text"]
+            assert "no turn of mine is running" in printed
+            assert answer["id"]  # the reply to the first message is still there
+        finally:
+            await client.close()
+            await harness.stop()
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_an_inspect_that_replies_to_nothing_of_ours_stays_quiet(tmp_path):
+    async def scenario():
+        hold = asyncio.Event()
+        hold.set()
+        _, harness, client, delivery, store, bridge, turn = await while_a_turn_runs(tmp_path, hold)
+        try:
+            await turn
+            before = len(delivery.sent)
+            await bridge.handle(reply_to(to=999, text="/inspect"))
+            assert len(delivery.sent) == before  # nothing printed, no turn started
+            assert len(harness.commands_named("fork")) == 1
+        finally:
+            await client.close()
+            await harness.stop()
             store.close()
 
     asyncio.run(scenario())

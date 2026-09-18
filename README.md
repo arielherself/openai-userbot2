@@ -41,6 +41,13 @@ own below:
 turns into `✅ <name>` or `❌ <name> failed (error)`. The turn ends on one of
 `✅ done`, `❌ failed`, `⏹️ cancelled`, and a failed one adds the error below.
 
+For as long as it stands, the tracking message is recorded against the block it
+is tracking, so replying to it with **`/inspect`** prints what the turn is doing
+— the block it runs in, the same trace with nothing clipped, and where the reply
+stands. That mapping is as temporary as the message: deleting the message drops
+it, and the answer to `/inspect` is a message of the userbot's like any other, so
+it can be asked about in turn. `/inspect` never starts a turn of its own.
+
 It appears only when the harness has actually produced something — a reasoning
 chunk, a tool call, the start of a draft — so a turn that is accepted and then
 fails without saying anything leaves no status message behind at all, just the

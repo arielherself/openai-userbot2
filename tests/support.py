@@ -120,6 +120,8 @@ class FakeTelegram:
         # Called with (chat_id, text) after a send, so a test can script the reply
         # the way a real bot would produce it.
         self.on_send = None
+        # When set, reading history waits on it — a way to hold a turn open.
+        self.hold: asyncio.Event | None = None
         # What a chat holds, for the tools that read history: id or @username -> view.
         self.chats: dict = {}
         self.fail_history = False
@@ -156,6 +158,8 @@ class FakeTelegram:
         return _FakeListener(self, chat_id)
 
     async def recent_messages(self, chat_id, limit=50) -> ChatView:
+        if self.hold is not None:
+            await self.hold.wait()
         if self.fail_history:
             raise RuntimeError("telegram said no")
         try:
