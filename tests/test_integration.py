@@ -165,6 +165,8 @@ def test_a_draft_round_trip_and_the_reply_that_follows_it(tmp_path):
                 "tg_read_message",
                 "tg_remove_schedule",
                 "tg_search_music",
+                "tg_send_file",
+                "tg_send_file_from_sandbox",
                 "tg_send_music",
                 "tg_send_parsed_content",
                 "tg_view_current_chat",
@@ -197,6 +199,8 @@ def test_a_draft_round_trip_and_the_reply_that_follows_it(tmp_path):
                 "tg_read_message",
                 "tg_remove_schedule",
                 "tg_search_music",
+                "tg_send_file",
+                "tg_send_file_from_sandbox",
                 "tg_send_music",
                 "tg_send_parsed_content",
                 "tg_view_current_chat",
@@ -244,6 +248,38 @@ def test_a_telegram_file_is_piped_into_a_sandbox_without_being_quoted(tmp_path):
             assert "Sandbox sbx-nosuch is not live" in sent
             # and the bytes themselves were never part of any request
             assert base64.b64encode(payload).decode("ascii") not in sent
+        finally:
+            store.close()
+
+
+def test_a_sandbox_file_is_piped_out_toward_the_chat(tmp_path):
+    """The pipe the other way: our call names nix_cat_file, and it does the read."""
+    with Fixture(tmp_path) as fixture:
+        store = MappingStore(str(tmp_path / "mappings.db"))
+        try:
+            fixture.provider.tool_call(
+                "tg_send_file_from_sandbox",
+                {"sandbox_id": "sbx-nosuch", "path": "/workspace/chart.png"},
+            )
+            fixture.provider.tool_call(
+                "tg_draft_response", {"summary": "没发出去", "details": "那个沙箱已经不在了。"}
+            )
+            fixture.provider.text("看过了。")
+
+            delivery = FakeTelegram()
+            asyncio.run(drive(fixture, store, [mention()], delivery))
+
+            assert delivery.live()[-1]["text"] == "没发出去\n\n那个沙箱已经不在了。"
+            # the real harness took the call we answered with, resolved
+            # tg_send_file as nix_cat_file's target — the arity it demands, the
+            # client it hands the file to next — and ran the read itself
+            sent = "\n".join(
+                json.dumps(request, ensure_ascii=False) for request in fixture.provider.payloads()
+            )
+            assert "[tool pipe] tg_send_file_from_sandbox -> nix_cat_file" in sent
+            assert "Sandbox sbx-nosuch is not live" in sent
+            # a file that was never read reached nobody
+            assert delivery.files_sent == []
         finally:
             store.close()
 

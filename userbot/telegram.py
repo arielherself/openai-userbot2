@@ -135,6 +135,9 @@ class Delivery(Protocol):
     ) -> int:
         """Send a message and return its id."""
 
+    async def send_file(self, chat_id: Entity, name: str, data: bytes) -> int:
+        """Send a file into a chat as a document called `name`, returning its id."""
+
     async def edit(self, chat_id: Entity, message_id: int, text: str) -> None:
         """Replace a message's text (status messages are plain text)."""
 
@@ -253,6 +256,18 @@ class TelethonDelivery:
             reply_to=reply_to,
             parse_mode=None,
             link_preview=False,
+        )
+        return message.id
+
+    async def send_file(self, chat_id, name, data) -> int:
+        # `force_document` keeps the bytes and the name exactly as they came: a
+        # picture is not re-encoded into a photo, and what Telegram stores is the
+        # file the tool named, not a guess at what it holds.
+        message = await self.client.send_file(
+            chat_id,
+            io.BytesIO(data),
+            attributes=[types.DocumentAttributeFilename(name)],
+            force_document=True,
         )
         return message.id
 

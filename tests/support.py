@@ -120,6 +120,8 @@ class FakeTelegram:
         self.edits: list[dict] = []
         self.deleted: list[tuple[int, tuple[int, ...]]] = []
         self.forwarded: list[dict] = []
+        # Documents, as they went out: what the file was called, and its bytes.
+        self.files_sent: list[dict] = []
         self.fail_send = False
         self.fail_forward = False
         # What the "other side" sends back: a chat the tools listen to gets these.
@@ -154,6 +156,15 @@ class FakeTelegram:
         )
         if self.on_send is not None:
             self.on_send(chat_id, text)
+        return self._next_id
+
+    async def send_file(self, chat_id, name, data) -> int:
+        if self.fail_send:
+            raise RuntimeError("telegram said no")
+        self._next_id += 1
+        self.files_sent.append(
+            {"id": self._next_id, "chat_id": chat_id, "name": name, "data": data}
+        )
         return self._next_id
 
     async def edit(self, chat_id, message_id, text) -> None:

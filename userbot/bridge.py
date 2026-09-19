@@ -46,9 +46,17 @@ from .music import send as send_music
 from .parse import TOOL as PARSE_TOOL
 from .parse import send as send_parsed
 from .render import MAX_UNITS, build_reply_parts, clamp_units
+from .sandbox import (
+    SEND_FILE_TOOL,
+    SEND_FROM_SANDBOX_TOOL,
+    download_to_sandbox,
+    export_arguments,
+    send_arguments,
+    send_from_sandbox,
+)
 from .sandbox import TOOL as DOWNLOAD_TOOL
-from .sandbox import download_to_sandbox
 from .sandbox import read_arguments as download_arguments
+from .sandbox import send_file as send_file_to_chat
 from .schedule import TOOLS as SCHEDULE_TOOLS
 from .schedule import add_task, remove_task, schedule_arguments, view_tasks
 from .status import StatusMessage, TurnStatus
@@ -67,6 +75,8 @@ VIEW_PUBLIC_TOOL_NAME = VIEW_TOOLS[1]["name"]
 READ_TOOL_NAME = VIEW_TOOLS[2]["name"]
 FORWARD_TOOL_NAME = VIEW_TOOLS[3]["name"]
 DOWNLOAD_TOOL_NAME = DOWNLOAD_TOOL["name"]
+SEND_FROM_SANDBOX_TOOL_NAME = SEND_FROM_SANDBOX_TOOL["name"]
+SEND_FILE_TOOL_NAME = SEND_FILE_TOOL["name"]
 CLONE_TOOL_NAME = FETCH_TOOLS[0]["name"]
 CURL_TOOL_NAME = FETCH_TOOLS[1]["name"]
 ADD_SCHEDULE_TOOL_NAME = SCHEDULE_TOOLS[0]["name"]
@@ -86,6 +96,8 @@ LOCAL_TOOLS = [
     SEND_TOOL,
     PARSE_TOOL,
     DOWNLOAD_TOOL,
+    SEND_FROM_SANDBOX_TOOL,
+    SEND_FILE_TOOL,
     *FETCH_TOOLS,
     *VIEW_TOOLS,
     *SCHEDULE_TOOLS,
@@ -99,6 +111,7 @@ UNDOABLE = (
     PARSE_TOOL_NAME,
     FORWARD_TOOL_NAME,
     ADD_SCHEDULE_TOOL_NAME,
+    SEND_FILE_TOOL_NAME,
 )
 
 
@@ -552,6 +565,10 @@ class Bridge:
             await self._send_parsed(turn, event, agent_id, call_id)
         elif name == DOWNLOAD_TOOL_NAME:
             await self._download_to_sandbox(event, agent_id, call_id)
+        elif name == SEND_FROM_SANDBOX_TOOL_NAME:
+            await self._send_from_sandbox(event, agent_id, call_id)
+        elif name == SEND_FILE_TOOL_NAME:
+            await self._send_file(turn, event, agent_id, call_id)
         elif name == CLONE_TOOL_NAME:
             await self._clone_to_sandbox(event, agent_id, call_id)
         elif name == CURL_TOOL_NAME:
@@ -672,6 +689,31 @@ class Bridge:
             arguments["path"],
         )
         await self._answer(agent_id, call_id, await download_to_sandbox(self.delivery, **arguments))
+
+    async def _send_from_sandbox(self, event: dict, agent_id: str, call_id: str) -> None:
+        """A sandbox file, handed to nix_cat_file so it can reach the chat."""
+        if not self._takes_pipes():
+            await self.hh.resolve_tool(
+                agent_id, call_id, error=self._pipe_refusal("a file out of a sandbox")
+            )
+            return
+        arguments, complaint = export_arguments(event.get("arguments") or {})
+        if complaint is not None:
+            await self.hh.resolve_tool(agent_id, call_id, error=complaint)
+            return
+        log.info("sending %s out of sandbox %s", arguments["path"], arguments["sandbox_id"])
+        await self._answer(agent_id, call_id, send_from_sandbox(**arguments))
+
+    async def _send_file(self, turn: _Turn, event: dict, agent_id: str, call_id: str) -> None:
+        """A file's bytes, posted into this chat under the name its path ends with."""
+        arguments, complaint = send_arguments(event.get("arguments") or {})
+        if complaint is not None:
+            await self.hh.resolve_tool(agent_id, call_id, error=complaint)
+            return
+        log.info("sending %s into chat %s", arguments["path"], turn.message.chat_id)
+        answer = await send_file_to_chat(self.delivery, turn.message.chat_id, **arguments)
+        self._forwarded(turn, call_id, answer)
+        await self._answer(agent_id, call_id, answer)
 
     async def _clone_to_sandbox(self, event: dict, agent_id: str, call_id: str) -> None:
         """A repository, cloned here and piped into the sandbox as one archive."""
@@ -798,10 +840,10 @@ class Bridge:
         protocol = (self.hh.hello or {}).get("protocol")
         return isinstance(protocol, int) and protocol >= PIPE_PROTOCOL
 
-    def _pipe_refusal(self) -> str:
+    def _pipe_refusal(self, carrying: str = "a file to a sandbox") -> str:
         """What to tell the model when the harness is too old to carry a pipe."""
         return (
-            "this harness cannot hand a file to a sandbox: tool pipes arrived in "
+            f"this harness cannot hand {carrying}: tool pipes arrived in "
             f"protocol 4, and it speaks {(self.hh.hello or {}).get('protocol')}"
         )
 

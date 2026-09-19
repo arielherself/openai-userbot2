@@ -44,6 +44,7 @@ class ScriptedAgent:
         "tg_send_parsed_content",
         "tg_forward_message",
         "tg_add_schedule",
+        "tg_send_file",
     )
 
     def __init__(
@@ -80,6 +81,12 @@ class ScriptedAgent:
         self.resolved: list[dict] = []
         # What a piped step said, by tool name — what the sandbox "wrote".
         self.piped: dict[str, str] = {}
+        # What a piped step hands its file on to, by name — how the fake follows
+        # the chain one step further, to a tool the client runs.
+        self.hands_on: dict[str, tuple[str, dict]] = {}
+        # The client-run steps the pipes ended at, in the order they ran: what a
+        # failed turn has to undo beside the calls the model made itself.
+        self.piped_calls: list[tuple[str, str, dict]] = []
 
     @staticmethod
     def _call_id(index: int) -> str:
@@ -157,8 +164,10 @@ class ScriptedAgent:
         """The events for a call the client answered with `call` instead of text.
 
         The real harness runs that tool itself and follows the chain until one
-        answers with text; one step is enough here, and what it says is what the
-        test scripted for it — the point is the shape of what comes back.
+        answers with text. A step of its own is scripted by name in `piped`; one
+        that runs on the client — what `hands_on` names, the way nix_cat_file
+        hands a sandbox file to tg_send_file — is asked of the client with a
+        `local_tool_called`, and the answer it sends back ends the chain.
         """
         call = self.answer_for(call_id).get("call")
         if not call:
@@ -167,6 +176,7 @@ class ScriptedAgent:
         chain = [name, call["name"]]
         text = self.piped.get(call["name"], "done")
         arguments = call.get("arguments", {})
+        handed = self.hands_on.get(call["name"])
         await conn.emit(
             event="pipe_step_started",
             agent_id=block,
@@ -197,10 +207,67 @@ class ScriptedAgent:
             text=text,
             text_chars=len(text),
             image_count=0,
+            next=handed[0] if handed else None,
+            elapsed_ms=1.0,
+        )
+        if handed is None:
+            return f"[tool pipe] {' -> '.join(chain)}\n{text}", chain, 1
+        step_name, step_arguments = handed
+        chain.append(step_name)
+        step_id = f"{call_id}:pipe:2"
+        waiting = self.answers[step_id] = asyncio.Event()
+        await conn.emit(
+            event="pipe_step_started",
+            agent_id=block,
+            round=1,
+            call_id=step_id,
+            parent_call_id=call_id,
+            step=2,
+            name=step_name,
+            via="client",
+            known=True,
+            arguments=step_arguments,
+            chain=chain,
+        )
+        await conn.emit(
+            event="local_tool_called",
+            agent_id=block,
+            round=1,
+            call_id=step_id,
+            name=step_name,
+            kind="call",
+            arguments=step_arguments,
+            raw_arguments="{}",
+            timeout_ms=120_000,
+            parent_call_id=call_id,
+            step=2,
+            chain=chain,
+        )
+        await asyncio.wait_for(waiting.wait(), 3)
+        answered = self.answer_for(step_id)
+        text = answered.get("result") or answered.get("error") or ""
+        self.piped_calls.append((step_id, step_name, step_arguments))
+        await conn.emit(
+            event="pipe_step_finished",
+            agent_id=block,
+            round=1,
+            call_id=step_id,
+            parent_call_id=call_id,
+            step=2,
+            name=step_name,
+            via="client",
+            known=True,
+            arguments=step_arguments,
+            chain=chain,
+            ok="error" not in answered,
+            error=answered.get("error"),
+            text=text,
+            text_chars=len(text),
+            image_count=0,
             next=None,
             elapsed_ms=1.0,
         )
-        return f"[tool pipe] {' -> '.join(chain)}\n{text}", chain, 1
+        return f"[tool pipe] {' -> '.join(chain)}\n{text}", chain, 2
 
     async def _done(self, conn, command) -> None:
         await conn.emit(
@@ -269,13 +336,19 @@ class ScriptedAgent:
             )
         if self.fail:
             # a turn that does not commit is offered the undo of everything it did,
-            # newest call first
+            # newest call first — the model's calls, and the client-run step a pipe
+            # ended at, like the file a send tool put into the chat
             undoable = [
-                index for index, (name, _) in enumerate(self.calls) if name in self.ROLLBACKS
+                (self._call_id(index), name, arguments)
+                for index, (name, arguments) in enumerate(self.calls)
+                if name in self.ROLLBACKS
             ]
-            for position, index in enumerate(reversed(undoable), start=1):
-                call_id = self._call_id(index)
-                name, arguments = self.calls[index]
+            undoable += [
+                (call_id, name, arguments)
+                for call_id, name, arguments in self.piped_calls
+                if name in self.ROLLBACKS
+            ]
+            for position, (call_id, name, arguments) in enumerate(reversed(undoable), start=1):
                 await conn.emit(
                     event="rollback_started",
                     call_id=call_id,
@@ -295,7 +368,10 @@ class ScriptedAgent:
                     call_ok=True,
                     timeout_ms=120_000,
                 )
-                await asyncio.wait_for(self.undos[f"{call_id}:rollback"].wait(), 3)
+                waiting = self.undos.get(f"{call_id}:rollback")
+                if waiting is None:
+                    waiting = self.undos[f"{call_id}:rollback"] = asyncio.Event()
+                await asyncio.wait_for(waiting.wait(), 3)
                 await conn.emit(
                     event="rollback_finished",
                     call_id=call_id,
@@ -475,6 +551,8 @@ def test_a_mention_opens_a_conversation_and_delivers_the_draft(tmp_path):
                 "tg_send_music",
                 "tg_send_parsed_content",
                 "tg_download_file_to_sandbox",
+                "tg_send_file_from_sandbox",
+                "tg_send_file",
                 "git_clone_to_sandbox",
                 "curl_to_sandbox",
                 "tg_view_current_chat",
@@ -501,6 +579,8 @@ def test_a_mention_opens_a_conversation_and_delivers_the_draft(tmp_path):
                 "tg_send_music",
                 "tg_send_parsed_content",
                 "tg_download_file_to_sandbox",
+                "tg_send_file_from_sandbox",
+                "tg_send_file",
                 "git_clone_to_sandbox",
                 "curl_to_sandbox",
                 "tg_view_current_chat",
@@ -558,6 +638,8 @@ def test_a_reply_continues_the_conversation_it_answered(tmp_path):
                 "tg_send_music",
                 "tg_send_parsed_content",
                 "tg_download_file_to_sandbox",
+                "tg_send_file_from_sandbox",
+                "tg_send_file",
                 "git_clone_to_sandbox",
                 "curl_to_sandbox",
                 "tg_view_current_chat",
@@ -1399,6 +1481,133 @@ def test_a_harness_that_cannot_pipe_is_told_so_before_a_clone_runs(tmp_path):
             await bridge.handle(mention())
             assert "protocol 4" in agent.answer_for("call_1")["error"]
             assert transfer.cloned == []  # nothing was fetched for nothing
+        finally:
+            await client.close()
+            await harness.stop()
+            store.close()
+
+    asyncio.run(scenario())
+
+
+# --- files out of a sandbox --------------------------------------------------
+
+
+def sandbox_file_out(**overrides) -> tuple[str, dict]:
+    arguments = {"sandbox_id": "sbx-3f2a9c1b7d0e", "path": "/workspace/chart.png"}
+    arguments.update(overrides)
+    return ("tg_send_file_from_sandbox", arguments)
+
+
+def handed_over(data: bytes, path: str = "/workspace/chart.png") -> tuple[str, dict]:
+    """What nix_cat_file hands on to a client tool: the path, then the bytes base64."""
+    return ("tg_send_file", {"path": path, "content": base64.b64encode(data).decode("ascii")})
+
+
+def test_a_sandbox_file_reaches_the_chat_through_a_pipe(tmp_path):
+    data = b"\x89PNG chart"
+    agent = ScriptedAgent(
+        calls=[
+            sandbox_file_out(),
+            ("tg_draft_response", {"summary": "发过去了", "details": "图在聊天里。"}),
+        ]
+    )
+    agent.piped["nix_cat_file"] = (
+        "read 11 bytes from /workspace/chart.png in sandbox sbx-3f2a9c1b7d0e"
+    )
+    agent.hands_on["nix_cat_file"] = handed_over(data)
+
+    async def scenario():
+        _, delivery, store = await run_bridge(agent, mention(), tmp_path)
+        try:
+            first = agent.answer_for("call_1")
+            assert first["call"]["name"] == "nix_cat_file"
+            assert first["call"]["arguments"] == {
+                "sandbox_id": "sbx-3f2a9c1b7d0e",
+                "path": "/workspace/chart.png",
+                "tool_name": "tg_send_file",
+            }
+            # the bytes came through the pipe and went into the chat as a document
+            sent = delivery.files_sent[-1]
+            assert (sent["chat_id"], sent["name"], sent["data"]) == (-100, "chart.png", data)
+            assert agent.answer_for("call_1:pipe:2")["result"] == (
+                f"sent chart.png ({len(data)} bytes) into the chat"
+            )
+            # the file is the turn's, like any forward: replying to it continues
+            assert store.lookup(-100, sent["id"]) == first["id"]
+            assert delivery.live()[-1]["text"] == "发过去了\n\n图在聊天里。"
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_failed_turn_takes_the_sent_file_back(tmp_path):
+    data = b"\x89PNG chart"
+    agent = ScriptedAgent(
+        fail=True,
+        calls=[
+            sandbox_file_out(),
+            ("tg_draft_response", {"summary": "s", "details": "d"}),
+        ],
+    )
+    agent.piped["nix_cat_file"] = "read 11 bytes from /workspace/chart.png"
+    agent.hands_on["nix_cat_file"] = handed_over(data)
+
+    async def scenario():
+        _, delivery, store = await run_bridge(agent, mention(), tmp_path)
+        try:
+            sent = delivery.files_sent[-1]
+            assert (-100, (sent["id"],)) in delivery.deleted
+            # and nothing of it is left to reply to
+            assert store.lookup(-100, sent["id"]) is None
+            assert "agent failed" in delivery.sent[-1]["text"]
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_send_of_a_malformed_path_is_refused_before_the_pipe(tmp_path):
+    agent = ScriptedAgent(
+        calls=[
+            sandbox_file_out(path="/workspace/../etc/passwd"),
+            ("tg_draft_response", {"summary": "s", "details": "d"}),
+        ]
+    )
+
+    async def scenario():
+        _, delivery, store = await run_bridge(agent, mention(), tmp_path)
+        try:
+            answer = agent.answer_for("call_1")
+            assert ".." in answer["error"]
+            assert "call" not in answer
+            assert delivery.files_sent == []  # nothing was read or sent for nothing
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_harness_that_cannot_pipe_is_told_so_before_a_file_is_sent(tmp_path):
+    agent = ScriptedAgent(
+        calls=[
+            sandbox_file_out(),
+            ("tg_draft_response", {"summary": "s", "details": "d"}),
+        ]
+    )
+
+    async def scenario():
+        harness = await FakeHarness(agent, protocol=3).start()
+        client = HHClient(harness.host, harness.port)
+        await client.connect()
+        delivery = FakeTelegram()
+        store = MappingStore(str(tmp_path / "mappings.db"))
+        try:
+            await Bridge(client, store, delivery, status_interval=0.0).handle(mention())
+            answer = agent.answer_for("call_1")
+            assert "protocol 4" in answer["error"]
+            assert "out of a sandbox" in answer["error"]
+            assert delivery.files_sent == []
         finally:
             await client.close()
             await harness.stop()

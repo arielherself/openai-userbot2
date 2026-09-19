@@ -302,6 +302,33 @@ All three need a harness speaking protocol `4` — tool pipes arrived with it. O
 older one the call answers with an error instead of fetching a file nothing could
 carry.
 
+### Files out of a sandbox
+
+| tool | what happens |
+|---|---|
+| `tg_send_file_from_sandbox(sandbox_id, path)` | a file a command left in a live sandbox is posted into this chat as a document named after the last part of its path — `/workspace/chart.png` arrives as `chart.png` |
+| `tg_send_file(path, content)` | the last step of that pipe: `nix_cat_file` hands it the path and the file's bytes, base64-encoded, and it posts them here under the name the path ends with |
+
+The file comes back out the way it went in, over the same wire.
+`tg_send_file_from_sandbox` answers with a **tool pipe** into the harness's
+`nix_cat_file`, which reads the file out of the sandbox and hands it straight to
+`tg_send_file` — a local tool, so the bytes cross the connection base64-encoded
+inside one `local_tool_called` event. Nothing of the file enters the transcript:
+the model is shown the chain (`[tool pipe] tg_send_file_from_sandbox ->
+nix_cat_file -> tg_send_file`) and what the send said, never the bytes. It goes
+as a document, exactly as the sandbox held it and under the name its path ends
+with — a picture is not re-encoded into a photo — and it is recorded against the
+block like the other forwards, so replying to it continues the conversation and a
+failed turn deletes it again.
+
+`path` is the file's absolute path in the sandbox, usually under `/workspace`,
+the only place a file outlives the `nix_exec` that made it; a path carrying `.` or
+`..` is refused before anything is read. A sandbox that is gone, a file that is
+missing or unreadable, and one past the harness's 200 MiB read limit all come
+back as **tool errors**. The read is the harness's own, so this pair needs a
+harness whose `nix_cat_file` can hand a file to a client-run tool, and protocol
+`4` like the pipes above.
+
 ## Requirements
 
 - Python ≥ 3.10 and [`uv`](https://docs.astral.sh/uv/)
@@ -407,15 +434,21 @@ auto-vacuum hands them back, so the file stays near the budget.
 - Replying to somebody else's message is quoted into the prompt; replying to the
   userbot's own message continues that conversation instead of quoting it back.
 - The local tools that post something — `tg_draft_response`, `tg_send_music`,
-  `tg_send_parsed_content` — declare a rollback, so a turn that fails after they
-  did takes the messages back down (and drops their mappings) before the failure
-  notice explains what happened. `tg_add_schedule` declares one too: the task it
-  put on the list is cancelled again instead.
-- The tools that put something into a sandbox — `tg_download_file_to_sandbox`,
+  `tg_send_parsed_content`, `tg_send_file` — declare a rollback, so a turn that
+  fails after they did takes the messages back down (and drops their mappings)
+  before the failure notice explains what happened. `tg_add_schedule` declares one
+  too: the task it put on the list is cancelled again instead. A rollback reaches
+  a pipe's own step like any other call: a file `tg_send_file` posted is deleted
+  even though the model never made that call itself.
+- The tools that move a file between a chat and a sandbox declare what the move
+  leaves behind. The ones going in — `tg_download_file_to_sandbox`,
   `git_clone_to_sandbox` and `curl_to_sandbox` — declare an external effect and no
   rollback: what they put into a sandbox is there to stay, and the failure note
-  says so rather than letting the next model assume the sandbox is clean. The
-  harness's own `nix_add_file`, which each pipe ends on, declares the same.
+  says so rather than letting the next model assume the sandbox is clean; the
+  harness's own `nix_add_file`, which each pipe ends on, declares the same. The
+  one coming out, `tg_send_file_from_sandbox`, changes nothing itself — its read
+  is the harness's — and the `tg_send_file` it pipes to answers for the document
+  it posted.
 - If the harness has forgotten the block a reply points at (eviction, or another
   database), the conversation restarts from a fresh root instead of staying silent.
 
@@ -441,7 +474,7 @@ userbot/music.py     the two tools that reach the music bot
 userbot/parse.py     the tool that has the parse bot render a link
 userbot/history.py   the tools that read a chat, one message, or forward it
 userbot/schedule.py  the scheduled tasks: the three tools, and the clock that fires them
-userbot/sandbox.py   the sandbox bits the pipe tools share, and a chat's file
+userbot/sandbox.py   the sandbox pipes both ways: a chat's file in, a sandbox's file out
 userbot/fetch.py     the tools that fetch a repository or a URL into a sandbox
 userbot/relay.py     the shape both share: ask a bot, wait for its answer
 userbot/tools.py     what the local tools share: their answer, their arguments

@@ -39,10 +39,15 @@ class StubClient:
         self.deleted: list[dict] = []
         self.forwarded: list[dict] = []
         self.downloaded: list[dict] = []
+        self.files: list[dict] = []
 
     async def send_message(self, chat_id, text, **fields):
         self.sent.append({"chat_id": chat_id, "text": text, **fields})
         return message(id=11, text=text)
+
+    async def send_file(self, chat_id, file=None, **fields):
+        self.files.append({"chat_id": chat_id, "data": file.getvalue(), **fields})
+        return message(id=13, text="")
 
     async def edit_message(self, chat_id, message_id, text, **fields):
         self.edits.append({"chat_id": chat_id, "message_id": message_id, "text": text, **fields})
@@ -177,6 +182,25 @@ def test_forwarding_returns_the_id_of_the_new_message():
         forwarded = await TelethonDelivery(client).forward("Music163DownBot", 77, -100)
         assert forwarded == 12
         assert client.forwarded == [{"to": -100, "message_id": 77, "from": "Music163DownBot"}]
+
+    asyncio.run(scenario())
+
+
+def test_a_file_goes_out_as_the_document_it_is():
+    async def scenario():
+        client = StubClient()
+        sent = await TelethonDelivery(client).send_file(-100, "chart.png", b"\x89PNG bytes")
+        assert sent == 13
+        # the bytes and the name exactly as they came: no photo re-encoding, and
+        # the name Telegram stores is the one the tool chose
+        assert client.files == [
+            {
+                "chat_id": -100,
+                "data": b"\x89PNG bytes",
+                "attributes": [types.DocumentAttributeFilename("chart.png")],
+                "force_document": True,
+            }
+        ]
 
     asyncio.run(scenario())
 
