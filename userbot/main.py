@@ -2,7 +2,8 @@
 
 Incoming Telegram messages are turned into `Incoming` here — that is the only
 place that knows about Telethon — and handed to the bridge on their own task, so
-one conversation never delays another.
+one conversation never delays another. One more task of the userbot's own runs
+the schedule clock, firing the tasks that have come due.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ from .bridge import Bridge, Identity, Incoming
 from .config import Config
 from .content import Quoted, content_of
 from .harness import HHClient, is_listening, spawn_server
+from .schedule import run_scheduler
 from .store import MappingStore
 from .telegram import TelethonDelivery, images_of, sender_of
 
@@ -111,6 +113,7 @@ async def serve(config: Config) -> None:
     harness = HHClient(config.harness_host, config.harness_port)
     spawned = None
     client = None
+    scheduler = None
     tasks: set[asyncio.Task] = set()
     try:
         if not is_listening(config.harness_host, config.harness_port):
@@ -169,6 +172,10 @@ async def serve(config: Config) -> None:
             tasks.add(task)
             task.add_done_callback(tasks.discard)
 
+        # The clock that fires scheduled tasks. It feeds the same `tasks` set, so
+        # a task that is mid-turn is waited for at shutdown like a message's turn.
+        scheduler = asyncio.create_task(run_scheduler(bridge, store, tasks))
+
         stop = asyncio.Event()
         loop = asyncio.get_running_loop()
         for name in ("SIGINT", "SIGTERM"):
@@ -180,6 +187,12 @@ async def serve(config: Config) -> None:
         await stop.wait()
         log.info("stopping")
     finally:
+        if scheduler is not None:
+            scheduler.cancel()
+            try:
+                await scheduler
+            except asyncio.CancelledError:
+                pass
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         if client is not None:

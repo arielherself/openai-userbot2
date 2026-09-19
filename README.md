@@ -218,6 +218,49 @@ under `[instant view content]`. A message with no text at all still says
 The userbot's own messages are sent with `link_preview=False`, so a reply that
 contains a link never grows a preview — and never an Instant View button.
 
+### Scheduled tasks
+
+A task fires once, at a time the agent names, and its answer goes back where it was
+set: the same chat, as a reply to the message that asked for it.
+
+| tool | what it does |
+|---|---|
+| `tg_add_schedule(content, at)` | puts a task on the list: at `at` — machine-local time, `YYYY-MM-DD HH:MM`, seconds optional — an agent turn starts in this very conversation, with `content` as its whole prompt |
+| `tg_view_schedule()` | everything waiting, soonest first, across all chats: id, local time with its offset, and the text it will run |
+| `tg_remove_schedule(id)` | cancels one task, so it never fires |
+
+`at` must be in the future and **at most 24 hours ahead**; a later time is refused,
+as is one that has already gone by (minutes are accepted a little behind the clock,
+so a "now" rounded down still works). The list holds **20 tasks at once** — when it
+is full `tg_add_schedule` answers with an error instead, and a task has to be
+cancelled or fire before another fits. The clock wakes for whatever is due next, so
+a task fires within seconds of its time; a task whose time passed while the userbot
+was down fires when it starts.
+
+When a task comes due the agent gets a prompt of the same shape as a message's —
+who it writes as, then the task's own text under `task:` where a message puts
+`from:` and `message:` — and is told to deliver the answer with
+`tg_draft_response` as the last thing it does:
+
+```
+[telegram]
+you are replying on behalf of the userbot 小助手 (@mybot, user id 4242)
+a scheduled task you set earlier is due now, and what you write goes to the chat it was set in, as a reply to the message it was set for
+task:
+提醒用户喝水
+[/telegram]
+Answer in the language of the task above — … deliver it by calling tg_draft_response …
+```
+
+The turn runs in the conversation that set the task, so the context that scheduled
+it is still there; if the harness has forgotten that block, it starts from a fresh
+root like any other turn. The answer is a message of the userbot's like any other,
+so replying to it continues the conversation. `tg_add_schedule` declares a
+rollback: a turn that fails after scheduling cancels the task again, so nothing
+fires that the user was never told about. The tasks live in the same SQLite file as
+the mappings, in a table of their own; they are few and short-lived, so the size
+budget never touches them.
+
 ### Files into a sandbox
 
 | tool | what happens |
@@ -366,7 +409,8 @@ auto-vacuum hands them back, so the file stays near the budget.
 - The local tools that post something — `tg_draft_response`, `tg_send_music`,
   `tg_send_parsed_content` — declare a rollback, so a turn that fails after they
   did takes the messages back down (and drops their mappings) before the failure
-  notice explains what happened.
+  notice explains what happened. `tg_add_schedule` declares one too: the task it
+  put on the list is cancelled again instead.
 - The tools that put something into a sandbox — `tg_download_file_to_sandbox`,
   `git_clone_to_sandbox` and `curl_to_sandbox` — declare an external effect and no
   rollback: what they put into a sandbox is there to stay, and the failure note
@@ -396,6 +440,7 @@ userbot/content.py   what a message carries: text, media placeholders, Instant V
 userbot/music.py     the two tools that reach the music bot
 userbot/parse.py     the tool that has the parse bot render a link
 userbot/history.py   the tools that read a chat, one message, or forward it
+userbot/schedule.py  the scheduled tasks: the three tools, and the clock that fires them
 userbot/sandbox.py   the sandbox bits the pipe tools share, and a chat's file
 userbot/fetch.py     the tools that fetch a repository or a URL into a sandbox
 userbot/relay.py     the shape both share: ask a bot, wait for its answer

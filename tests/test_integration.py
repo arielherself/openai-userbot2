@@ -18,6 +18,7 @@ import os
 import pathlib
 import socket
 import sys
+from datetime import datetime, timedelta
 
 import pytest
 from support import FakeTelegram, bold_of, quotes_in, serving, text_of
@@ -25,6 +26,7 @@ from support import FakeTelegram, bold_of, quotes_in, serving, text_of
 from userbot.bridge import Bridge, Identity, Incoming
 from userbot.content import Content, Quoted
 from userbot.harness import HHClient, spawn_server
+from userbot.schedule import run_scheduler
 from userbot.store import MappingStore
 
 pytestmark = pytest.mark.integration
@@ -156,15 +158,18 @@ def test_a_draft_round_trip_and_the_reply_that_follows_it(tmp_path):
             assert sorted(names) == [
                 "curl_to_sandbox",
                 "git_clone_to_sandbox",
+                "tg_add_schedule",
                 "tg_download_file_to_sandbox",
                 "tg_draft_response",
                 "tg_forward_message",
                 "tg_read_message",
+                "tg_remove_schedule",
                 "tg_search_music",
                 "tg_send_music",
                 "tg_send_parsed_content",
                 "tg_view_current_chat",
                 "tg_view_public_chat",
+                "tg_view_schedule",
             ]
 
             # replying to the answer joins that conversation instead of starting one
@@ -185,15 +190,18 @@ def test_a_draft_round_trip_and_the_reply_that_follows_it(tmp_path):
             assert sorted(names) == [
                 "curl_to_sandbox",
                 "git_clone_to_sandbox",
+                "tg_add_schedule",
                 "tg_download_file_to_sandbox",
                 "tg_draft_response",
                 "tg_forward_message",
                 "tg_read_message",
+                "tg_remove_schedule",
                 "tg_search_music",
                 "tg_send_music",
                 "tg_send_parsed_content",
                 "tg_view_current_chat",
                 "tg_view_public_chat",
+                "tg_view_schedule",
             ]
             # it carries the whole exchange: the prompt, the tool call, the answer
             assert blocks[second]["context_len"] > blocks[first]["context_len"]
@@ -356,6 +364,110 @@ def test_a_reply_to_a_message_we_never_sent_is_ignored(tmp_path):
             delivery = asyncio.run(drive(fixture, store, [reply_to(to=999)]))
             assert delivery.sent == []
             assert fixture.provider.count == 0
+        finally:
+            store.close()
+
+
+def local_at(seconds_from_now: float) -> str:
+    """A local time the way the model writes one."""
+    when = datetime.now().astimezone() + timedelta(seconds=seconds_from_now)
+    return when.strftime("%Y-%m-%d %H:%M:%S")
+
+
+async def clock_until(fixture, store, delivery, ready) -> None:
+    """Run the schedule clock against the real server until `ready()` says done."""
+    harness = HHClient(fixture.server.host, fixture.server.port)
+    await harness.connect()
+    tasks: set[asyncio.Task] = set()
+    bridge = Bridge(
+        harness,
+        store,
+        delivery,
+        status_interval=0.0,
+        identity=Identity(name="小助手", username="mybot", user_id=4242),
+    )
+    clock = asyncio.create_task(run_scheduler(bridge, store, tasks))
+    try:
+        for _ in range(1000):
+            if ready():
+                return
+            await asyncio.sleep(0.01)
+        raise AssertionError("the clock never fired the task")
+    finally:
+        clock.cancel()
+        try:
+            await clock
+        except asyncio.CancelledError:
+            pass
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await harness.close()
+
+
+def test_a_task_is_scheduled_and_its_time_comes(tmp_path):
+    with Fixture(tmp_path) as fixture:
+        store = MappingStore(str(tmp_path / "mappings.db"))
+        try:
+            fixture.provider.tool_call(
+                "tg_add_schedule", {"content": "提醒用户喝水", "at": local_at(1)}
+            )
+            fixture.provider.tool_call(
+                "tg_draft_response", {"summary": "好的", "details": "稍后提醒你。"}
+            )
+            fixture.provider.text("安排好了。")
+            delivery = asyncio.run(drive(fixture, store, [mention()]))
+
+            (task,) = store.schedules()
+            assert task.content == "提醒用户喝水"
+            # its answer belongs where the asking happened
+            assert task.chat_id == CHAT and task.message_id == 50
+            assert delivery.live()[-1]["text"] == "好的\n\n稍后提醒你。"
+
+            # when its time comes the clock runs it, and the answer goes there
+            fixture.provider.tool_call(
+                "tg_draft_response", {"summary": "该喝水了", "details": "记得喝水。"}
+            )
+            fixture.provider.text("提醒完了。")
+            answer_text = "该喝水了\n\n记得喝水。"
+            asyncio.run(
+                clock_until(
+                    fixture,
+                    store,
+                    delivery,
+                    lambda: any(message["text"] == answer_text for message in delivery.sent),
+                )
+            )
+
+            assert store.schedules() == []  # it fired once, and is gone
+            answer = [m for m in delivery.sent if m["text"] == answer_text][-1]
+            assert answer["chat_id"] == CHAT and answer["reply_to"] == 50
+            # what the agent was given is a task, not a message from anyone
+            sent = "\n".join(
+                json.dumps(request, ensure_ascii=False) for request in fixture.provider.payloads()
+            )
+            assert "a scheduled task you set earlier is due now" in sent
+            assert "task:\\n提醒用户喝水" in sent  # the JSON blob escapes the newline
+        finally:
+            store.close()
+
+
+def test_a_failed_turn_takes_a_scheduled_task_back(tmp_path):
+    with Fixture(tmp_path) as fixture:
+        store = MappingStore(str(tmp_path / "mappings.db"))
+        try:
+            fixture.provider.tool_call(
+                "tg_add_schedule", {"content": "提醒用户喝水", "at": local_at(600)}
+            )
+            fixture.provider.tool_call(
+                "tg_draft_response", {"summary": "先记下", "details": "这段会被撤回"}
+            )
+            fixture.provider.error(status=500, body=b"the provider fell over")
+            delivery = asyncio.run(drive(fixture, store, [mention()]))
+
+            # the failed turn undid its work: the reply went back, and so did the task
+            assert (CHAT, (delivery.sent[1]["id"],)) in delivery.deleted
+            assert store.schedules() == []
+            failure = delivery.live()[-1]
+            assert "agent failed" in failure["text"]
         finally:
             store.close()
 

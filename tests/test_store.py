@@ -1,12 +1,30 @@
-"""The mapping store: lookups, roots, and the size budget."""
+"""The mapping store: lookups, roots, the size budget, and scheduled tasks."""
 
 from __future__ import annotations
 
-from userbot.store import MappingStore
+from userbot.store import MappingStore, Schedule
 
 
 def store_at(tmp_path, max_bytes=8 * 1024 * 1024) -> MappingStore:
     return MappingStore(str(tmp_path / "mappings.db"), max_bytes)
+
+
+def task(
+    id="sch-a",
+    content="提醒我喝水",
+    due_at=100.0,
+    chat_id=-100,
+    message_id=50,
+    agent_id="tg-a",
+) -> Schedule:
+    return Schedule(
+        id=id,
+        content=content,
+        due_at=due_at,
+        chat_id=chat_id,
+        message_id=message_id,
+        agent_id=agent_id,
+    )
 
 
 def test_a_message_points_at_the_block_that_answered_it(tmp_path):
@@ -83,3 +101,52 @@ def test_a_budget_of_zero_keeps_everything(tmp_path):
         store.record(1, message_id, "tg-x")
     assert store.count() == 500
     store.close()
+
+
+def test_tasks_are_listed_soonest_first(tmp_path):
+    store = store_at(tmp_path)
+    store.add_schedule(task(id="sch-b", due_at=200.0))
+    store.add_schedule(task(id="sch-a", due_at=100.0))
+    assert [one.id for one in store.schedules()] == ["sch-a", "sch-b"]
+    assert store.count_schedules() == 2
+    assert store.next_due() == 100.0
+    store.close()
+
+
+def test_the_due_tasks_are_the_ones_at_or_before_now(tmp_path):
+    store = store_at(tmp_path)
+    store.add_schedule(task(id="sch-a", due_at=100.0))
+    store.add_schedule(task(id="sch-b", due_at=200.0))
+    assert [one.id for one in store.due_schedules(150.0)] == ["sch-a"]
+    assert [one.id for one in store.due_schedules(200.0)] == ["sch-a", "sch-b"]
+    assert store.due_schedules(99.0) == []
+    store.close()
+
+
+def test_a_task_carries_where_its_answer_goes(tmp_path):
+    store = store_at(tmp_path)
+    store.add_schedule(task(chat_id=-100123, message_id=42, agent_id="tg-abc"))
+    (one,) = store.schedules()
+    assert (one.chat_id, one.message_id, one.agent_id) == (-100123, 42, "tg-abc")
+    store.close()
+
+
+def test_a_cancelled_task_is_gone_and_so_is_the_next_due(tmp_path):
+    store = store_at(tmp_path)
+    store.add_schedule(task(id="sch-a"))
+    assert store.remove_schedule("sch-a") is True
+    assert store.remove_schedule("sch-a") is False  # there is nothing left to remove
+    assert store.schedules() == []
+    assert store.next_due() is None
+    store.close()
+
+
+def test_tasks_survive_a_restart(tmp_path):
+    path = str(tmp_path / "mappings.db")
+    first = MappingStore(path)
+    first.add_schedule(task(id="sch-a", content="提醒我喝水"))
+    first.close()
+    second = MappingStore(path)
+    (one,) = second.schedules()
+    assert one.id == "sch-a" and one.content == "提醒我喝水"
+    second.close()

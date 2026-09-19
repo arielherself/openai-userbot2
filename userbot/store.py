@@ -1,9 +1,15 @@
-"""The mapping between Telegram messages and harness agent blocks.
+"""The mapping between Telegram messages and harness agent blocks, and the tasks
+waiting for their time.
 
 Every message this userbot sends can be replied to, and a reply must continue the
 conversation that produced it. So each sent message is recorded against the agent
 block that answered it: `(chat_id, message_id) -> agent_id`, plus one root block
 per chat, which is where a fresh conversation forks from.
+
+A scheduled task is a row of its own: what to do, when, and the chat and message
+its answer belongs to. Tasks are few and short-lived — one fires and is gone — so
+they are kept apart from the message mappings, whose size budget never touches
+them.
 
 The file has a size budget. SQLite reuses the pages freed by a delete, so keeping
 the *live* pages under the budget is what keeps the file from growing without
@@ -16,6 +22,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 import time
+from dataclasses import dataclass
 
 log = logging.getLogger(__name__)
 
@@ -36,7 +43,31 @@ CREATE TABLE IF NOT EXISTS roots (
     agent_id   TEXT    NOT NULL,
     created_at REAL    NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS schedules (
+    id         TEXT    PRIMARY KEY,
+    content    TEXT    NOT NULL,
+    due_at     REAL    NOT NULL,
+    chat_id    INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    agent_id   TEXT    NOT NULL,
+    created_at REAL    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS schedules_due ON schedules (due_at);
 """
+
+
+@dataclass(frozen=True)
+class Schedule:
+    """One task waiting for its time: what to do, when, and where it answers."""
+
+    id: str
+    content: str
+    due_at: float
+    chat_id: int
+    message_id: int
+    # The block that set the task, so it fires in that conversation.
+    agent_id: str
 
 
 class MappingStore:
@@ -110,6 +141,55 @@ class MappingStore:
     def forget_root(self, chat_id: int) -> None:
         self.con.execute("DELETE FROM roots WHERE chat_id = ?", (chat_id,))
         self.con.commit()
+
+    # --- scheduled tasks --------------------------------------------------
+    def add_schedule(self, task: Schedule) -> None:
+        self.con.execute(
+            "INSERT OR REPLACE INTO schedules "
+            "(id, content, due_at, chat_id, message_id, agent_id, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                task.id,
+                task.content,
+                task.due_at,
+                task.chat_id,
+                task.message_id,
+                task.agent_id,
+                time.time(),
+            ),
+        )
+        self.con.commit()
+
+    def schedules(self) -> list[Schedule]:
+        """Every waiting task, the soonest first."""
+        rows = self.con.execute(
+            "SELECT id, content, due_at, chat_id, message_id, agent_id FROM schedules "
+            "ORDER BY due_at, id"
+        ).fetchall()
+        return [Schedule(*row) for row in rows]
+
+    def due_schedules(self, now: float) -> list[Schedule]:
+        """The tasks whose time has come, the soonest first."""
+        rows = self.con.execute(
+            "SELECT id, content, due_at, chat_id, message_id, agent_id FROM schedules "
+            "WHERE due_at <= ? ORDER BY due_at, id",
+            (now,),
+        ).fetchall()
+        return [Schedule(*row) for row in rows]
+
+    def next_due(self) -> float | None:
+        """When the soonest task fires, or None when nothing is waiting."""
+        row = self.con.execute("SELECT MIN(due_at) FROM schedules").fetchone()
+        return row[0] if row and row[0] is not None else None
+
+    def remove_schedule(self, task_id: str) -> bool:
+        """Forget one task; True when it was there to forget."""
+        cursor = self.con.execute("DELETE FROM schedules WHERE id = ?", (task_id,))
+        self.con.commit()
+        return cursor.rowcount > 0
+
+    def count_schedules(self) -> int:
+        return self.con.execute("SELECT COUNT(*) FROM schedules").fetchone()[0]
 
     # --- the size budget --------------------------------------------------
     def live_bytes(self) -> int:

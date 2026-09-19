@@ -49,7 +49,10 @@ from .render import MAX_UNITS, build_reply_parts, clamp_units
 from .sandbox import TOOL as DOWNLOAD_TOOL
 from .sandbox import download_to_sandbox
 from .sandbox import read_arguments as download_arguments
+from .schedule import TOOLS as SCHEDULE_TOOLS
+from .schedule import add_task, remove_task, schedule_arguments, view_tasks
 from .status import StatusMessage, TurnStatus
+from .store import Schedule
 from .telegram import MAX_IMAGES
 from .tools import chat_argument, message_id_argument, text_argument
 
@@ -66,6 +69,9 @@ FORWARD_TOOL_NAME = VIEW_TOOLS[3]["name"]
 DOWNLOAD_TOOL_NAME = DOWNLOAD_TOOL["name"]
 CLONE_TOOL_NAME = FETCH_TOOLS[0]["name"]
 CURL_TOOL_NAME = FETCH_TOOLS[1]["name"]
+ADD_SCHEDULE_TOOL_NAME = SCHEDULE_TOOLS[0]["name"]
+VIEW_SCHEDULE_TOOL_NAME = SCHEDULE_TOOLS[1]["name"]
+REMOVE_SCHEDULE_TOOL_NAME = SCHEDULE_TOOLS[2]["name"]
 
 # The protocol that carries images on a fork and on a tool result.
 IMAGE_PROTOCOL = 3
@@ -82,10 +88,18 @@ LOCAL_TOOLS = [
     DOWNLOAD_TOOL,
     *FETCH_TOOLS,
     *VIEW_TOOLS,
+    *SCHEDULE_TOOLS,
 ]
 
 # The tools that declare a rollback: a turn that failed undoes their work.
-UNDOABLE = (TOOL_NAME, SEARCH_TOOL_NAME, SEND_TOOL_NAME, PARSE_TOOL_NAME, FORWARD_TOOL_NAME)
+UNDOABLE = (
+    TOOL_NAME,
+    SEARCH_TOOL_NAME,
+    SEND_TOOL_NAME,
+    PARSE_TOOL_NAME,
+    FORWARD_TOOL_NAME,
+    ADD_SCHEDULE_TOOL_NAME,
+)
 
 
 @dataclass
@@ -106,6 +120,9 @@ class Incoming:
     quoted: Quoted | None = None
     # The message's pictures, as `data:` URIs, ready to ride along with the fork.
     images: list[str] = field(default_factory=list)
+    # A task that came due rather than a message from anyone: there is no sender
+    # to name, and the prompt is built as the task it is.
+    scheduled: bool = False
 
 
 @dataclass
@@ -140,30 +157,42 @@ def build_prompt(message: Incoming, identity: Identity | None = None) -> str:
             "you are replying on behalf of the userbot "
             f"{_who(identity.name, identity.username, identity.user_id)}"
         )
-    header.append(f"from: {_who(message.sender_name, message.sender_username, message.sender_id)}")
-    if message.is_group:
-        group = [f"group id {message.chat_id}"]
-        if message.chat_username:
-            group.insert(0, f"@{message.chat_username}")
-        header.append(f"group: {message.chat_title or 'unnamed group'} ({', '.join(group)})")
-    if message.quoted is not None:
-        quoted = message.quoted
+    if message.scheduled:
+        # No sender to name: the text is what a turn asked for itself, earlier,
+        # and the answer goes on where that turn happened.
         header.append(
-            f"replying to {_who(quoted.sender_name, quoted.sender_username, quoted.sender_id)}:"
+            "a scheduled task you set earlier is due now, and what you write goes "
+            "to the chat it was set in, as a reply to the message it was set for"
         )
-        if quoted.excerpt:
-            header.append(f"the sender highlighted: {quoted.excerpt}")
-        header.append("--- quoted message ---")
-        header.append(quoted.content.render())
-        header.append("--- end of quoted message ---")
-    elif message.reply_to_message_id is not None:
-        header.append("this message replies to one you sent earlier")
+    else:
+        header.append(
+            f"from: {_who(message.sender_name, message.sender_username, message.sender_id)}"
+        )
+        if message.is_group:
+            group = [f"group id {message.chat_id}"]
+            if message.chat_username:
+                group.insert(0, f"@{message.chat_username}")
+            header.append(f"group: {message.chat_title or 'unnamed group'} ({', '.join(group)})")
+        if message.quoted is not None:
+            quoted = message.quoted
+            header.append(
+                f"replying to {_who(quoted.sender_name, quoted.sender_username, quoted.sender_id)}:"
+            )
+            if quoted.excerpt:
+                header.append(f"the sender highlighted: {quoted.excerpt}")
+            header.append("--- quoted message ---")
+            header.append(quoted.content.render())
+            header.append("--- end of quoted message ---")
+        elif message.reply_to_message_id is not None:
+            header.append("this message replies to one you sent earlier")
+    label = "task" if message.scheduled else "message"
+    subject = "the task" if message.scheduled else "the sender's message"
     return (
         "\n".join(header)
-        + "\nmessage:\n"
+        + f"\n{label}:\n"
         + message.content.render()
         + "\n[/telegram]\n"
-        + "Answer in the language of the sender's message above — in English if that "
+        + f"Answer in the language of {subject} above — in English if that "
         + "language cannot be told — and deliver it by calling "
         + f"{TOOL_NAME} (a short reply in `summary`, the full answer in `details`, "
         + "which the sender reads too) as the last thing you do."
@@ -226,6 +255,9 @@ class _Turn:
     # What a rollback would have to delete, per local call: the messages a call
     # put into the chat, keyed by that call's id.
     effects: dict[str, list[int]] = field(default_factory=dict)
+    # What a rollback would have to cancel, per local call: the tasks a call
+    # scheduled, keyed by that call's id.
+    scheduled: dict[str, str] = field(default_factory=dict)
 
 
 class Bridge:
@@ -281,6 +313,27 @@ class Bridge:
             await self._failure(message, block, str(error))
         except Exception as error:
             log.exception("the turn for %s broke", message.message_id)
+            await self._failure(message, block, f"internal error: {error}")
+
+    async def fire(self, task: Schedule) -> None:
+        """Run one task that has come due: its text goes to the agent, the answer here."""
+        message = Incoming(
+            chat_id=task.chat_id,
+            message_id=task.message_id,
+            content=Content(text=task.content),
+            sender_id=None,
+            sender_name="a scheduled task",
+            scheduled=True,
+        )
+        block = None
+        try:
+            block, forked_from = await self._fork(message, task.agent_id)
+            await self._turn(message, block, forked_from)
+        except HarnessError as error:
+            log.warning("the harness refused the scheduled task %s: %s", task.id, error)
+            await self._failure(message, block, str(error))
+        except Exception as error:
+            log.exception("the scheduled task %s broke", task.id)
             await self._failure(message, block, f"internal error: {error}")
 
     async def _inspect(self, message: Incoming) -> None:
@@ -511,6 +564,12 @@ class Bridge:
             await self._read_one(turn, event, agent_id, call_id)
         elif name == FORWARD_TOOL_NAME:
             await self._forward_one(turn, event, agent_id, call_id)
+        elif name == ADD_SCHEDULE_TOOL_NAME:
+            await self._add_schedule(turn, event, agent_id, call_id)
+        elif name == VIEW_SCHEDULE_TOOL_NAME:
+            await self._view_schedules(agent_id, call_id)
+        elif name == REMOVE_SCHEDULE_TOOL_NAME:
+            await self._remove_schedule(event, agent_id, call_id)
         else:
             await self.hh.resolve_tool(agent_id, call_id, error=f"unknown local tool: {name}")
 
@@ -690,6 +749,45 @@ class Bridge:
         self._forwarded(turn, call_id, answer)
         await self._answer(agent_id, call_id, answer)
 
+    async def _add_schedule(self, turn: _Turn, event: dict, agent_id: str, call_id: str) -> None:
+        """A task for this chat, to run later and answer here."""
+        content, due_at, complaint = schedule_arguments(event.get("arguments") or {})
+        if complaint is not None:
+            await self.hh.resolve_tool(agent_id, call_id, error=complaint)
+            return
+        answer = add_task(
+            self.store,
+            content,
+            due_at,
+            turn.message.chat_id,
+            turn.message.message_id,
+            turn.block,
+        )
+        if answer.scheduled is not None:
+            turn.scheduled[call_id] = answer.scheduled
+        await self._answer(agent_id, call_id, answer)
+
+    async def _view_schedules(self, agent_id: str, call_id: str) -> None:
+        """Everything that is waiting for its time, soonest first."""
+        await self._answer(agent_id, call_id, view_tasks(self.store))
+
+    async def _remove_schedule(self, event: dict, agent_id: str, call_id: str) -> None:
+        """One task, taken off the list by the id the view printed."""
+        task_id, complaint = text_argument(event.get("arguments") or {}, "id")
+        if complaint is not None:
+            await self.hh.resolve_tool(agent_id, call_id, error=complaint)
+            return
+        await self._answer(agent_id, call_id, remove_task(self.store, task_id))
+
+    async def _undo_schedule(self, turn: _Turn, agent_id: str, call_id: str, original: str) -> None:
+        """A failed turn takes its task back: it will not fire."""
+        task_id = turn.scheduled.pop(original, None)
+        if task_id is None or not self.store.remove_schedule(task_id):
+            await self.hh.resolve_tool(agent_id, call_id, result="nothing to undo")
+            return
+        log.info("the failed turn cancelled the scheduled task %s", task_id)
+        await self.hh.resolve_tool(agent_id, call_id, result=f"cancelled the task {task_id}")
+
     def _takes_images(self) -> bool:
         """Whether the harness we are talking to knows about images at all."""
         protocol = (self.hh.hello or {}).get("protocol")
@@ -742,6 +840,9 @@ class Bridge:
 
         if name not in UNDOABLE:
             await self.hh.resolve_tool(agent_id, call_id, error=f"nothing to undo for {name}")
+            return
+        if name == ADD_SCHEDULE_TOOL_NAME:
+            await self._undo_schedule(turn, agent_id, call_id, original)
             return
         messages = turn.effects.pop(original, [])
         if name == TOOL_NAME:

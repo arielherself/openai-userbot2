@@ -7,6 +7,7 @@ import base64
 import io
 import tarfile
 import time
+from datetime import datetime, timedelta
 
 from support import (
     FakeHarness,
@@ -25,7 +26,8 @@ from userbot.content import Content, Quoted
 from userbot.harness import HHClient
 from userbot.music import MUSIC_BOT, Gate
 from userbot.parse import PARSE_BOT
-from userbot.store import MappingStore
+from userbot.schedule import MAX_AHEAD, MAX_TASKS
+from userbot.store import MappingStore, Schedule
 
 
 class ScriptedAgent:
@@ -41,6 +43,7 @@ class ScriptedAgent:
         "tg_send_music",
         "tg_send_parsed_content",
         "tg_forward_message",
+        "tg_add_schedule",
     )
 
     def __init__(
@@ -478,6 +481,9 @@ def test_a_mention_opens_a_conversation_and_delivers_the_draft(tmp_path):
                 "tg_view_public_chat",
                 "tg_read_message",
                 "tg_forward_message",
+                "tg_add_schedule",
+                "tg_view_schedule",
+                "tg_remove_schedule",
             ]
             assert created["local_tools"][0]["rollback"] is True
             # the harness must be willing to wait at least as long as the music
@@ -501,6 +507,9 @@ def test_a_mention_opens_a_conversation_and_delivers_the_draft(tmp_path):
                 "tg_view_public_chat",
                 "tg_read_message",
                 "tg_forward_message",
+                "tg_add_schedule",
+                "tg_view_schedule",
+                "tg_remove_schedule",
             ]
             assert fork["local_timeout"] >= 300
 
@@ -555,6 +564,9 @@ def test_a_reply_continues_the_conversation_it_answered(tmp_path):
                 "tg_view_public_chat",
                 "tg_read_message",
                 "tg_forward_message",
+                "tg_add_schedule",
+                "tg_view_schedule",
+                "tg_remove_schedule",
             ]
             assert "replies to one you sent earlier" in fork["prompt"]
             assert delivery.sent[1]["reply_to"] == 51
@@ -1778,6 +1790,253 @@ def test_an_inspect_that_replies_to_nothing_of_ours_stays_quiet(tmp_path):
         finally:
             await client.close()
             await harness.stop()
+            store.close()
+
+    asyncio.run(scenario())
+
+
+# --- scheduled tasks ---------------------------------------------------------
+
+
+def local_time(seconds_from_now: float) -> str:
+    """A local time the way the model writes one."""
+    when = datetime.now().astimezone() + timedelta(seconds=seconds_from_now)
+    return when.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def add_schedule(content="提醒我喝水", seconds=1800) -> tuple[str, dict]:
+    return ("tg_add_schedule", {"content": content, "at": local_time(seconds)})
+
+
+def test_a_turn_can_schedule_a_task_for_this_chat(tmp_path):
+    agent = ScriptedAgent(
+        calls=[
+            add_schedule(),
+            ("tg_draft_response", {"summary": "好的", "details": "30 分钟后提醒你。"}),
+        ]
+    )
+
+    async def scenario():
+        harness, _, store = await run_bridge(agent, mention(), tmp_path)
+        try:
+            answer = agent.answer_for("call_1")
+            assert answer["result"].startswith("scheduled as sch-")
+            (task,) = store.schedules()
+            block = harness.commands_named("fork")[0]["new_id"]
+            assert task.id in answer["result"]
+            assert task.content == "提醒我喝水"
+            # the reply goes where the asking happened: this chat, this message
+            assert task.chat_id == -100 and task.message_id == 50
+            assert task.agent_id == block  # and the conversation that set it
+            assert abs(task.due_at - (time.time() + 1800)) < 5
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_task_further_than_a_day_is_refused(tmp_path):
+    agent = ScriptedAgent(
+        calls=[
+            ("tg_add_schedule", {"content": "提醒我喝水", "at": local_time(MAX_AHEAD + 600)}),
+            ("tg_draft_response", {"summary": "s", "details": "d"}),
+        ]
+    )
+
+    async def scenario():
+        _, _, store = await run_bridge(agent, mention(), tmp_path)
+        try:
+            assert "24 hours" in agent.answer_for("call_1")["error"]
+            assert store.schedules() == []
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_task_at_a_time_already_past_is_refused(tmp_path):
+    agent = ScriptedAgent(
+        calls=[
+            ("tg_add_schedule", {"content": "提醒我喝水", "at": local_time(-3600)}),
+            ("tg_draft_response", {"summary": "s", "details": "d"}),
+        ]
+    )
+
+    async def scenario():
+        _, _, store = await run_bridge(agent, mention(), tmp_path)
+        try:
+            assert "already passed" in agent.answer_for("call_1")["error"]
+            assert store.schedules() == []
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_full_list_refuses_a_new_task(tmp_path):
+    agent = ScriptedAgent(
+        calls=[
+            add_schedule(),
+            ("tg_draft_response", {"summary": "s", "details": "d"}),
+        ]
+    )
+
+    def ready(store):
+        for index in range(MAX_TASKS):
+            store.add_schedule(
+                Schedule(
+                    id=f"sch-{index}",
+                    content="已经满了",
+                    due_at=time.time() + 600,
+                    chat_id=-100,
+                    message_id=50,
+                    agent_id="tg-a",
+                )
+            )
+
+    async def scenario():
+        _, _, store = await run_bridge(agent, mention(), tmp_path, store_ready=ready)
+        try:
+            assert f"already {MAX_TASKS}" in agent.answer_for("call_1")["error"]
+            assert store.count_schedules() == MAX_TASKS  # nothing was added
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_the_agent_can_see_and_cancel_what_is_waiting(tmp_path):
+    agent = ScriptedAgent(
+        calls=[
+            ("tg_view_schedule", {}),
+            ("tg_remove_schedule", {"id": "sch-ready"}),
+            ("tg_remove_schedule", {"id": "sch-nope"}),
+            ("tg_draft_response", {"summary": "s", "details": "d"}),
+        ]
+    )
+
+    def ready(store):
+        store.add_schedule(
+            Schedule(
+                id="sch-ready",
+                content="提醒我喝水",
+                due_at=time.time() + 900,
+                chat_id=-100,
+                message_id=50,
+                agent_id="tg-a",
+            )
+        )
+
+    async def scenario():
+        _, _, store = await run_bridge(agent, mention(), tmp_path, store_ready=ready)
+        try:
+            listing = agent.answer_for("call_1")["result"]
+            assert "[sch-ready]" in listing and "提醒我喝水" in listing
+            assert "chat -100" in listing
+            assert "cancelled" in agent.answer_for("call_2")["result"]
+            assert "no scheduled task" in agent.answer_for("call_3")["error"]
+            assert store.schedules() == []
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_failed_turn_cancels_the_task_it_scheduled(tmp_path):
+    agent = ScriptedAgent(
+        fail=True,
+        calls=[
+            add_schedule(),
+            ("tg_draft_response", {"summary": "s", "details": "d"}),
+        ],
+    )
+
+    async def scenario():
+        _, delivery, store = await run_bridge(agent, mention(), tmp_path)
+        try:
+            assert store.schedules() == []  # the turn did not commit: nothing fires
+            assert "cancelled" in agent.answer_for("call_1:rollback")["result"]
+            assert "agent failed" in delivery.sent[-1]["text"]
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+async def fire_into(tmp_path, agent, task):
+    """Run one due task through a real bridge; returns what to assert on."""
+    harness = await FakeHarness(agent).start()
+    client = HHClient(harness.host, harness.port)
+    await client.connect()
+    delivery = FakeTelegram()
+    store = MappingStore(str(tmp_path / "mappings.db"))
+    bridge = Bridge(
+        client,
+        store,
+        delivery,
+        status_interval=0.0,
+        identity=Identity(name="小助手", username="mybot", user_id=4242),
+    )
+    try:
+        await bridge.fire(task)
+    finally:
+        await client.close()
+        await harness.stop()
+    return harness, delivery, store
+
+
+def test_a_due_task_answers_in_the_chat_it_was_set_in(tmp_path):
+    agent = ScriptedAgent(summary="该喝水了", details="记得喝水。")
+    task = Schedule(
+        id="sch-due",
+        content="提醒用户喝水",
+        due_at=time.time() - 1,
+        chat_id=-100,
+        message_id=50,
+        agent_id="tg-old",
+    )
+
+    async def scenario():
+        harness, delivery, store = await fire_into(tmp_path, agent, task)
+        try:
+            fork = harness.commands_named("fork")[0]
+            assert fork["id"] == "tg-old"  # it runs in the conversation that set it
+            assert "a scheduled task you set earlier is due now" in fork["prompt"]
+            assert "task:\n提醒用户喝水" in fork["prompt"]
+            assert "calling tg_draft_response" in fork["prompt"]
+
+            answer = delivery.sent[-1]
+            assert answer["chat_id"] == -100
+            assert answer["reply_to"] == 50  # the message it was set for, answered
+            assert answer["text"] == "该喝水了\n\n记得喝水。"
+            # the answer is the userbot's like any other: replying to it continues
+            assert store.lookup(-100, answer["id"]) == fork["new_id"]
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_due_task_whose_conversation_is_gone_starts_a_fresh_one(tmp_path):
+    agent = ScriptedAgent(missing_parent="tg-gone", summary="该喝水了", details="记得喝水。")
+    task = Schedule(
+        id="sch-due",
+        content="提醒用户喝水",
+        due_at=time.time() - 1,
+        chat_id=-100,
+        message_id=50,
+        agent_id="tg-gone",
+    )
+
+    async def scenario():
+        harness, delivery, store = await fire_into(tmp_path, agent, task)
+        try:
+            forks = harness.commands_named("fork")
+            assert forks[0]["id"] == "tg-gone"  # refused
+            assert len(harness.commands_named("create_agent")) == 1
+            assert forks[-1]["id"] != "tg-gone"  # retried from a fresh root
+            assert delivery.sent[-1]["reply_to"] == 50
+        finally:
             store.close()
 
     asyncio.run(scenario())

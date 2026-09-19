@@ -24,6 +24,8 @@ class Answer:
     error: str = ""
     # What a rollback would have to delete: what the tool put into the chat.
     forwarded: int | None = None
+    # What a rollback would have to cancel: a task this call scheduled, by id.
+    scheduled: str | None = None
     # Pictures that go with the result, as `data:` URIs.
     images: list[str] = field(default_factory=list)
     # The tool to run next, `{"name": …, "arguments": …}`, instead of reporting
