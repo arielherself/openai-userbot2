@@ -23,19 +23,19 @@ from telethon.tl import types
 from telethon.tl.custom import Message as TelegramMessage
 
 from .content import Content, content_of
+from .tools import MAX_DOWNLOAD_BYTES
 
 # Where a message goes: an id, or a username like the music bot's.
 Entity = int | str
 
-# How much image to hand over. It rides in the same single JSON line as everything
-# else, base64 makes it a third bigger again, and the harness stops at 8 MiB.
+# How much image to hand over. Pictures stay in the transcript — every later
+# request carries them again — so they are kept small on purpose.
 MAX_IMAGE_BYTES = 3 * 1024 * 1024
 MAX_IMAGES_BYTES = 5 * 1024 * 1024
 MAX_IMAGES = 4
-# How much file to hand over. A file is piped into a tool as base64 in one
-# command, and the harness refuses a command over 8 MiB, so five megabytes of
-# bytes is a third under the ceiling with room for the rest of the line.
-MAX_FILE_BYTES = 5 * 1024 * 1024
+# How much file to hand over: the one rule every download into a sandbox shares
+# (tools.MAX_DOWNLOAD_BYTES), which the harness's own per-call ceiling sits above.
+MAX_FILE_BYTES = MAX_DOWNLOAD_BYTES
 # Photos come in several sizes; wide enough to read, narrow enough to be small.
 USEFUL_WIDTH = 1280
 

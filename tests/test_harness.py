@@ -7,7 +7,21 @@ import asyncio
 import pytest
 from support import FakeHarness
 
-from userbot.harness import CONNECTION_LOST, HarnessError, HHClient
+from userbot.harness import ADD_FILE_BYTES, CONNECTION_LOST, LINE_LIMIT, HarnessError, HHClient
+from userbot.tools import MAX_DOWNLOAD_BYTES
+
+
+def test_a_full_size_payload_fits_one_command_line():
+    """The line limit is derived from what a sandbox takes, not guessed at.
+
+    A file reaches a sandbox as base64 inside one command, so the longest line
+    the two sides accept has to hold the biggest file `nix_add_file` takes —
+    base64 makes it a third bigger again, plus the JSON around it. The server
+    derives its own limit the same way, so the two cannot drift apart; and what
+    one download may bring down stays under both.
+    """
+    assert LINE_LIMIT >= ADD_FILE_BYTES * 4 // 3 + 2 * 1024 * 1024
+    assert MAX_DOWNLOAD_BYTES < ADD_FILE_BYTES < LINE_LIMIT
 
 
 async def script(harness, conn, command):

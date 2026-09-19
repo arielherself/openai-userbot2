@@ -26,8 +26,14 @@ import time
 
 log = logging.getLogger(__name__)
 
-# The server rejects a line over 8 MiB, so the reader has to accept them too.
-LINE_LIMIT = 8 * 1024 * 1024 + 4096
+# The biggest file the harness's own `nix_add_file` takes in one call
+# (`ADD_FILE_MAX_BYTES` in its sandbox_tools.py), and the command line that has to
+# carry it: base64 makes the bytes a third bigger again, plus room for the JSON
+# around them. The server derives its own limit the same way (`MAX_COMMAND_BYTES`
+# in its src/server.py), so a full-size payload is one line and both sides agree
+# on how long that is.
+ADD_FILE_BYTES = 200 * 1024 * 1024
+LINE_LIMIT = ADD_FILE_BYTES * 4 // 3 + 2 * 1024 * 1024
 
 CONNECTION_LOST = "connection_lost"
 

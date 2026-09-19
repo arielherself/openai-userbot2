@@ -223,28 +223,47 @@ contains a link never grows a preview — and never an Instant View button.
 | tool | what happens |
 |---|---|
 | `tg_download_file_to_sandbox(chat_id, message_id, sandbox_id, path)` | the file a message carries is downloaded and written into a live harness sandbox at `path`; the bytes go straight there, never through the model |
+| `git_clone_to_sandbox(url, sandbox_id, path, depth, branch)` | the repository is cloned on the userbot's side — a sandbox has no network — and arrives as one `tar.gz` holding the checkout **and its `.git`**, to unpack with `nix_exec` |
+| `curl_to_sandbox(url, sandbox_id, path)` | what the URL serves — a PDF, a picture, an archive, a script — is fetched with `curl` and written into the sandbox at `path` |
 
-The userbot fetches the file — Telethon's `download_media` — and hands what it got
-to the harness's own `nix_add_file` as a **tool pipe**. The model is shown the two
-tool names and what the sandbox wrote, and the file itself stays out of the
-transcript however large it is; the ceiling is **5 MB**, because a piped argument
-travels as base64 inside one command, which the harness refuses past 8 MiB.
+All three end the same way: the userbot fetches the bytes **on this side of the
+wire** and hands them to the harness's own `nix_add_file` as a **tool pipe**. The
+model is shown the two tool names and what the sandbox wrote, and the file itself
+stays out of the transcript however large it is. What travels is a piped argument,
+one command's worth of base64, which is also what sizes the ceiling: the harness
+takes **200 MiB** in one `nix_add_file` call, so nothing here may bring more than
+**150 MB** down at once. A download is measured while it runs and stopped the
+moment it crosses that, so a runaway clone or an endless URL costs a moment rather
+than the disk.
+
+Only `http(s)` URLs are fetched: a sandbox tool reaches the network, never this
+machine's filesystem, so `file://` and `ftp://` are refused before anything runs.
+`path` has to be under the sandbox's writable `/workspace`, the only place a file
+outlives the `nix_exec` that made it (`/workspace/../…` is refused rather than
+followed), and both fetch tools take their name from the URL when they are not
+told one — `/workspace/<repository>.tar.gz` and `/workspace/<last segment>`. A
+clone lands as the archive it is, so its `path` must end in `.tar.gz`; `depth`
+says how much history comes with it (1, the tip commit only, unless more is asked
+for — 0 is the whole history) and `branch` a branch or tag other than the default.
+A fresh sandbox has no `tar` of its own — the agent installs `gnutar` and `gzip`
+(and `git`, for the `.git` the archive carries) with `nix_add_dependency` before
+unpacking it with `nix_exec`.
 
 `chat_id` names the chat the way the reading tools do — a public `@name`, or the
-id they print — and `path` has to be under the sandbox's writable `/workspace`,
-the only place a file outlives the `nix_exec` that made it (`/workspace/../…` is
-refused rather than followed). A message that carries no file, a destination
-somewhere else, a chat that cannot be read and a sandbox that is no longer live
-all come back as **tool errors**, so the agent can look again rather than assume
-the file is there.
+id they print. A message that carries no file, a destination somewhere else, a URL
+that cannot be reached, a reply that passes the cap and a sandbox that is no
+longer live all come back as **tool errors**, so the agent can look again rather
+than assume the file is there.
 
-This is the one tool that needs a harness speaking protocol `4` — tool pipes
-arrived with it. On an older one the call answers with an error instead of
-fetching a file nothing could carry.
+All three need a harness speaking protocol `4` — tool pipes arrived with it. On an
+older one the call answers with an error instead of fetching a file nothing could
+carry.
 
 ## Requirements
 
 - Python ≥ 3.10 and [`uv`](https://docs.astral.sh/uv/)
+- `git` and `curl` on the machine that runs the userbot: the two fetch tools clone
+  and download there, because a sandbox has no network of its own
 - a `headless-harness` checkout (defaults to `~/headless-harness`), whose own
   `.venv` is used when the userbot starts its server
 - Telegram API credentials from <https://my.telegram.org> (`api_id`, `api_hash`)
@@ -348,10 +367,11 @@ auto-vacuum hands them back, so the file stays near the budget.
   `tg_send_parsed_content` — declare a rollback, so a turn that fails after they
   did takes the messages back down (and drops their mappings) before the failure
   notice explains what happened.
-- `tg_download_file_to_sandbox` declares an external effect and no rollback: the
-  file it puts into a sandbox is there to stay, and the failure note says so
-  rather than letting the next model assume the sandbox is clean. The harness's
-  own `nix_add_file`, which the pipe ends on, declares the same.
+- The tools that put something into a sandbox — `tg_download_file_to_sandbox`,
+  `git_clone_to_sandbox` and `curl_to_sandbox` — declare an external effect and no
+  rollback: what they put into a sandbox is there to stay, and the failure note
+  says so rather than letting the next model assume the sandbox is clean. The
+  harness's own `nix_add_file`, which each pipe ends on, declares the same.
 - If the harness has forgotten the block a reply points at (eviction, or another
   database), the conversation restarts from a fresh root instead of staying silent.
 
@@ -376,7 +396,8 @@ userbot/content.py   what a message carries: text, media placeholders, Instant V
 userbot/music.py     the two tools that reach the music bot
 userbot/parse.py     the tool that has the parse bot render a link
 userbot/history.py   the tools that read a chat, one message, or forward it
-userbot/sandbox.py   the tool that carries a chat's file into a sandbox
+userbot/sandbox.py   the sandbox bits the pipe tools share, and a chat's file
+userbot/fetch.py     the tools that fetch a repository or a URL into a sandbox
 userbot/relay.py     the shape both share: ask a bot, wait for its answer
 userbot/tools.py     what the local tools share: their answer, their arguments
 userbot/harness.py   the harness wire protocol, one connection, many conversations

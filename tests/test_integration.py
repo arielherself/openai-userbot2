@@ -20,7 +20,7 @@ import socket
 import sys
 
 import pytest
-from support import FakeTelegram, bold_of, quotes_in, text_of
+from support import FakeTelegram, bold_of, quotes_in, serving, text_of
 
 from userbot.bridge import Bridge, Identity, Incoming
 from userbot.content import Content, Quoted
@@ -154,6 +154,8 @@ def test_a_draft_round_trip_and_the_reply_that_follows_it(tmp_path):
             names = [item["name"] if isinstance(item, dict) else item for item in local]
             # the server keeps them in name order, whatever order we declared them
             assert sorted(names) == [
+                "curl_to_sandbox",
+                "git_clone_to_sandbox",
                 "tg_download_file_to_sandbox",
                 "tg_draft_response",
                 "tg_forward_message",
@@ -181,6 +183,8 @@ def test_a_draft_round_trip_and_the_reply_that_follows_it(tmp_path):
                 for item in blocks[second]["local_tools"]
             ]
             assert sorted(names) == [
+                "curl_to_sandbox",
+                "git_clone_to_sandbox",
                 "tg_download_file_to_sandbox",
                 "tg_draft_response",
                 "tg_forward_message",
@@ -231,6 +235,34 @@ def test_a_telegram_file_is_piped_into_a_sandbox_without_being_quoted(tmp_path):
             assert "[tool pipe] tg_download_file_to_sandbox -> nix_add_file" in sent
             assert "Sandbox sbx-nosuch is not live" in sent
             # and the bytes themselves were never part of any request
+            assert base64.b64encode(payload).decode("ascii") not in sent
+        finally:
+            store.close()
+
+
+def test_a_fetched_url_is_piped_into_a_sandbox_without_being_quoted(tmp_path):
+    """The same pipe, driven by the real curl and a real local server."""
+    payload = b"%PDF-1.4 fetched over http"
+    with Fixture(tmp_path) as fixture, serving(payload) as url:
+        store = MappingStore(str(tmp_path / "mappings.db"))
+        try:
+            fixture.provider.tool_call(
+                "curl_to_sandbox",
+                {"url": url, "sandbox_id": "sbx-nosuch", "path": "/workspace/report.pdf"},
+            )
+            fixture.provider.tool_call(
+                "tg_draft_response", {"summary": "拿到了", "details": "放进沙箱了。"}
+            )
+            fixture.provider.text("放好了。")
+            delivery = asyncio.run(drive(fixture, store, [mention()]))
+
+            assert delivery.live()[-1]["text"] == "拿到了\n\n放进沙箱了。"
+            sent = "\n".join(
+                json.dumps(request, ensure_ascii=False) for request in fixture.provider.payloads()
+            )
+            assert "[tool pipe] curl_to_sandbox -> nix_add_file" in sent
+            assert "Sandbox sbx-nosuch is not live" in sent
+            # the bytes went to the sandbox, never to the provider
             assert base64.b64encode(payload).decode("ascii") not in sent
         finally:
             store.close()

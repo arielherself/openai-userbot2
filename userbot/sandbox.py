@@ -1,9 +1,12 @@
-"""The tool that puts a Telegram file into a sandbox.
+"""The sandbox tools' shared half, and the one that carries a chat's file.
 
-The bytes never travel through the model: the file is downloaded here and handed
-straight to the harness's own `nix_add_file` as the next step of a tool pipe, so
-the transcript only ever sees the two tool names and what the sandbox wrote —
-never the base64 payload that carried them.
+Everything that puts something into a sandbox — a message's file, a clone, a URL —
+ends the same way: a tool pipe into the harness's own `nix_add_file`, whose
+arguments this module builds (`add_file_pipe`) and whose destination rules it
+enforces (`sandbox_path`). The bytes never travel through the model: the file is
+fetched here and handed straight over as the next step of the pipe, so the
+transcript only ever sees the tool names and what the sandbox wrote — never the
+base64 payload that carried them.
 """
 
 from __future__ import annotations
@@ -35,6 +38,8 @@ TOOL = {
         "`path`: where the file goes in the sandbox — an absolute path under "
         "/workspace, like /workspace/report.pdf. Its directory is created for "
         "you, and a file that starts with `#!` is made executable.\n"
+        "The file may be up to 150 MB; a bigger one is refused rather than "
+        "half handed over.\n"
         "Returns what the sandbox wrote, so the file is then there to read, run "
         "or unpack with nix_exec."
     ),
@@ -109,6 +114,18 @@ def read_arguments(arguments: dict) -> tuple[dict, str | None]:
     }, None
 
 
+def add_file_pipe(sandbox_id: str, path: str, data: bytes) -> dict:
+    """The next step of a pipe: `nix_add_file` writing these bytes at `path`."""
+    return {
+        "name": ADD_FILE,
+        "arguments": {
+            "sandbox_id": sandbox_id,
+            "path": path,
+            "content_base64": base64.b64encode(data).decode("ascii"),
+        },
+    }
+
+
 async def download_to_sandbox(
     delivery: Delivery, chat_id, message_id: int, sandbox_id: str, path: str
 ) -> Answer:
@@ -131,12 +148,5 @@ async def download_to_sandbox(
             + (f" of {downloaded.name}" if downloaded.name else "")
             + f" from message {message_id}"
         ),
-        call={
-            "name": ADD_FILE,
-            "arguments": {
-                "sandbox_id": sandbox_id,
-                "path": path,
-                "content_base64": base64.b64encode(downloaded.data).decode("ascii"),
-            },
-        },
+        call=add_file_pipe(sandbox_id, path, downloaded.data),
     )

@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
+import tarfile
 import time
 
 from support import (
     FakeHarness,
     FakeTelegram,
+    FakeTransfer,
     bold_of,
     bot_message,
     chat_message,
@@ -384,7 +387,14 @@ def reply_to(message_id=51, to=1000, text="继续说", quoted=None) -> Incoming:
 
 
 async def run_bridge(
-    agent, message, tmp_path, store_ready=None, identity=None, delivery_ready=None, music_gate=None
+    agent,
+    message,
+    tmp_path,
+    store_ready=None,
+    identity=None,
+    delivery_ready=None,
+    music_gate=None,
+    transfer=None,
 ):
     """Drive one message through the bridge; returns everything to assert on."""
     harness = await FakeHarness(agent).start()
@@ -397,7 +407,13 @@ async def run_bridge(
     if delivery_ready:
         delivery_ready(delivery)  # e.g. script the music bot's answers
     bridge = Bridge(
-        client, store, delivery, status_interval=0.0, identity=identity, music_gate=music_gate
+        client,
+        store,
+        delivery,
+        status_interval=0.0,
+        identity=identity,
+        music_gate=music_gate,
+        transfer=transfer,
     )
     try:
         await bridge.handle(message)
@@ -456,6 +472,8 @@ def test_a_mention_opens_a_conversation_and_delivers_the_draft(tmp_path):
                 "tg_send_music",
                 "tg_send_parsed_content",
                 "tg_download_file_to_sandbox",
+                "git_clone_to_sandbox",
+                "curl_to_sandbox",
                 "tg_view_current_chat",
                 "tg_view_public_chat",
                 "tg_read_message",
@@ -477,6 +495,8 @@ def test_a_mention_opens_a_conversation_and_delivers_the_draft(tmp_path):
                 "tg_send_music",
                 "tg_send_parsed_content",
                 "tg_download_file_to_sandbox",
+                "git_clone_to_sandbox",
+                "curl_to_sandbox",
                 "tg_view_current_chat",
                 "tg_view_public_chat",
                 "tg_read_message",
@@ -529,6 +549,8 @@ def test_a_reply_continues_the_conversation_it_answered(tmp_path):
                 "tg_send_music",
                 "tg_send_parsed_content",
                 "tg_download_file_to_sandbox",
+                "git_clone_to_sandbox",
+                "curl_to_sandbox",
                 "tg_view_current_chat",
                 "tg_view_public_chat",
                 "tg_read_message",
@@ -1172,6 +1194,199 @@ def test_a_harness_that_cannot_pipe_is_told_so(tmp_path):
             answer = agent.answer_for("call_1")
             assert "protocol 4" in answer["error"]
             assert delivery.downloaded == []  # nothing was fetched for nothing
+        finally:
+            await client.close()
+            await harness.stop()
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_clone_reaches_the_sandbox_as_one_archive(tmp_path):
+    agent = ScriptedAgent(
+        calls=[
+            (
+                "git_clone_to_sandbox",
+                {
+                    "url": "https://github.com/psf/requests.git",
+                    "sandbox_id": "sbx-3f2a9c1b7d0e",
+                    "path": "/workspace/requests.tar.gz",
+                    "depth": 1,
+                },
+            ),
+            ("tg_draft_response", {"summary": "克隆好了", "details": "在沙箱里。"}),
+        ]
+    )
+    transfer = FakeTransfer(file=b"print('hello')\n")
+    agent.piped["nix_add_file"] = "wrote /workspace/requests.tar.gz (301 bytes)"
+
+    async def scenario():
+        _, delivery, store = await run_bridge(agent, mention(), tmp_path, transfer=transfer)
+        try:
+            answer = agent.answer_for("call_1")
+            assert answer["call"]["name"] == "nix_add_file"
+            arguments = answer["call"]["arguments"]
+            assert arguments["sandbox_id"] == "sbx-3f2a9c1b7d0e"
+            assert arguments["path"] == "/workspace/requests.tar.gz"
+            # what travels is one tar.gz of the checkout, `.git` included
+            archive = base64.b64decode(arguments["content_base64"])
+            with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as packed:
+                assert "requests/README.md" in packed.getnames()
+                assert "requests/.git" in packed.getnames()
+            assert transfer.cloned == [("https://github.com/psf/requests.git", "", 1)]
+            # the clone itself is a note for the pipe's trace, not for the model
+            assert "cloned https://github.com/psf/requests.git" in answer["result"]
+            assert delivery.live()[-1]["text"] == "克隆好了\n\n在沙箱里。"
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_url_reaches_the_sandbox_as_its_own_bytes(tmp_path):
+    data = b"%PDF-1.4 fetched"
+    agent = ScriptedAgent(
+        calls=[
+            (
+                "curl_to_sandbox",
+                {
+                    "url": "https://example.test/report.pdf",
+                    "sandbox_id": "sbx-7f",
+                    "path": "/workspace/report.pdf",
+                },
+            ),
+            ("tg_draft_response", {"summary": "拿到了", "details": "在沙箱里。"}),
+        ]
+    )
+    transfer = FakeTransfer(file=data)
+
+    async def scenario():
+        _, _, store = await run_bridge(agent, mention(), tmp_path, transfer=transfer)
+        try:
+            answer = agent.answer_for("call_1")
+            assert answer["call"]["arguments"] == {
+                "sandbox_id": "sbx-7f",
+                "path": "/workspace/report.pdf",
+                "content_base64": base64.b64encode(data).decode("ascii"),
+            }
+            assert transfer.fetched == ["https://example.test/report.pdf"]
+            assert f"{len(data)} bytes" in answer["result"]
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_url_a_sandbox_may_not_fetch_is_refused_before_anything_runs(tmp_path):
+    agent = ScriptedAgent(
+        calls=[
+            (
+                "git_clone_to_sandbox",
+                {"url": "file:///home/someone/notes.git", "sandbox_id": "sbx-7f"},
+            ),
+            (
+                "curl_to_sandbox",
+                {"url": "ftp://example.test/x", "sandbox_id": "sbx-7f", "path": "/workspace/x"},
+            ),
+            ("tg_draft_response", {"summary": "s", "details": "d"}),
+        ]
+    )
+    transfer = FakeTransfer(file=b"x")
+
+    async def scenario():
+        _, _, store = await run_bridge(agent, mention(), tmp_path, transfer=transfer)
+        try:
+            for call_id in ("call_1", "call_2"):
+                assert "http(s)" in agent.answer_for(call_id)["error"]
+            assert transfer.cloned == [] and transfer.fetched == []
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_transfer_that_fails_comes_back_as_a_tool_error(tmp_path):
+    agent = ScriptedAgent(
+        calls=[
+            (
+                "git_clone_to_sandbox",
+                {"url": "https://example.test/r.git", "sandbox_id": "sbx-7f"},
+            ),
+            (
+                "curl_to_sandbox",
+                {
+                    "url": "https://example.test/x.pdf",
+                    "sandbox_id": "sbx-7f",
+                    "path": "/workspace/x.pdf",
+                },
+            ),
+            ("tg_draft_response", {"summary": "s", "details": "d"}),
+        ]
+    )
+    transfer = FakeTransfer(fail="the network said no")
+
+    async def scenario():
+        _, delivery, store = await run_bridge(agent, mention(), tmp_path, transfer=transfer)
+        try:
+            for call_id in ("call_1", "call_2"):
+                answer = agent.answer_for(call_id)
+                assert "the network said no" in answer["error"] and "call" not in answer
+            # a failed tool does not end the turn: the draft still went out
+            assert delivery.live()[-1]["text"] == "s\n\nd"
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_payload_of_a_few_hundred_kilobytes_travels_in_one_line(tmp_path):
+    """A pipe carries a file's worth of base64, not a chat message's."""
+    data = bytes(range(256)) * 1024
+    agent = ScriptedAgent(
+        calls=[
+            (
+                "curl_to_sandbox",
+                {
+                    "url": "https://example.test/big.bin",
+                    "sandbox_id": "sbx-7f",
+                    "path": "/workspace/big.bin",
+                },
+            ),
+            ("tg_draft_response", {"summary": "s", "details": "d"}),
+        ]
+    )
+    transfer = FakeTransfer(file=data)
+
+    async def scenario():
+        _, _, store = await run_bridge(agent, mention(), tmp_path, transfer=transfer)
+        try:
+            sent = agent.answer_for("call_1")["call"]["arguments"]["content_base64"]
+            assert base64.b64decode(sent) == data
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_harness_that_cannot_pipe_is_told_so_before_a_clone_runs(tmp_path):
+    agent = ScriptedAgent(
+        calls=[
+            ("git_clone_to_sandbox", {"url": "https://example.test/r.git", "sandbox_id": "sbx-7f"}),
+            ("tg_draft_response", {"summary": "s", "details": "d"}),
+        ]
+    )
+    transfer = FakeTransfer(file=b"x")
+
+    async def scenario():
+        harness = await FakeHarness(agent, protocol=3).start()
+        client = HHClient(harness.host, harness.port)
+        await client.connect()
+        store = MappingStore(str(tmp_path / "mappings.db"))
+        try:
+            bridge = Bridge(client, store, FakeTelegram(), status_interval=0.0, transfer=transfer)
+            await bridge.handle(mention())
+            assert "protocol 4" in agent.answer_for("call_1")["error"]
+            assert transfer.cloned == []  # nothing was fetched for nothing
         finally:
             await client.close()
             await harness.stop()

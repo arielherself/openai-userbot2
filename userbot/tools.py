@@ -9,6 +9,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+# The most one download may bring into a sandbox, whatever it is: a Telegram file,
+# a clone, a URL. The harness's own `nix_add_file` takes 200 MiB in one call
+# (`ADD_FILE_BYTES` in harness.py), so this stays under it, and a fetch that would
+# cross it is cut off rather than finished.
+MAX_DOWNLOAD_BYTES = 150 * 1024 * 1024
+
 
 @dataclass
 class Answer:

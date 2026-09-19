@@ -25,6 +25,15 @@ import time
 from dataclasses import dataclass, field
 
 from .content import Content, Quoted
+from .fetch import TOOLS as FETCH_TOOLS
+from .fetch import (
+    CommandTransfer,
+    Transfer,
+    clone_arguments,
+    clone_to_sandbox,
+    curl_to_sandbox,
+    fetch_arguments,
+)
 from .harness import CONNECTION_LOST, TG_DRAFT_TOOL, HarnessError, new_agent_id
 from .history import TOOLS as VIEW_TOOLS
 from .history import current_chat as view_current_chat
@@ -55,6 +64,8 @@ VIEW_PUBLIC_TOOL_NAME = VIEW_TOOLS[1]["name"]
 READ_TOOL_NAME = VIEW_TOOLS[2]["name"]
 FORWARD_TOOL_NAME = VIEW_TOOLS[3]["name"]
 DOWNLOAD_TOOL_NAME = DOWNLOAD_TOOL["name"]
+CLONE_TOOL_NAME = FETCH_TOOLS[0]["name"]
+CURL_TOOL_NAME = FETCH_TOOLS[1]["name"]
 
 # The protocol that carries images on a fork and on a tool result.
 IMAGE_PROTOCOL = 3
@@ -63,7 +74,15 @@ IMAGE_PROTOCOL = 3
 PIPE_PROTOCOL = 4
 
 # Everything the agent can ask this userbot to do.
-LOCAL_TOOLS = [TG_DRAFT_TOOL, SEARCH_TOOL, SEND_TOOL, PARSE_TOOL, DOWNLOAD_TOOL, *VIEW_TOOLS]
+LOCAL_TOOLS = [
+    TG_DRAFT_TOOL,
+    SEARCH_TOOL,
+    SEND_TOOL,
+    PARSE_TOOL,
+    DOWNLOAD_TOOL,
+    *FETCH_TOOLS,
+    *VIEW_TOOLS,
+]
 
 # The tools that declare a rollback: a turn that failed undoes their work.
 UNDOABLE = (TOOL_NAME, SEARCH_TOOL_NAME, SEND_TOOL_NAME, PARSE_TOOL_NAME, FORWARD_TOOL_NAME)
@@ -220,6 +239,7 @@ class Bridge:
         model: str | None = None,
         identity: Identity | None = None,
         music_gate: Gate | None = None,
+        transfer: Transfer | None = None,
     ) -> None:
         self.hh = harness
         self.store = store
@@ -230,6 +250,8 @@ class Bridge:
         self.identity = identity
         # one gate for the whole userbot: the music bot is shared between chats
         self.music_gate = music_gate if music_gate is not None else Gate()
+        # where a clone or a URL is fetched, on this side of the wire
+        self.transfer = transfer if transfer is not None else CommandTransfer()
         # the turns running right now, by block, for `/inspect` to look at
         self._turns: dict[str, _Turn] = {}
 
@@ -477,6 +499,10 @@ class Bridge:
             await self._send_parsed(turn, event, agent_id, call_id)
         elif name == DOWNLOAD_TOOL_NAME:
             await self._download_to_sandbox(event, agent_id, call_id)
+        elif name == CLONE_TOOL_NAME:
+            await self._clone_to_sandbox(event, agent_id, call_id)
+        elif name == CURL_TOOL_NAME:
+            await self._curl_to_sandbox(event, agent_id, call_id)
         elif name == VIEW_CURRENT_TOOL_NAME:
             await self._read_current(turn, agent_id, call_id)
         elif name == VIEW_PUBLIC_TOOL_NAME:
@@ -573,15 +599,7 @@ class Bridge:
     async def _download_to_sandbox(self, event: dict, agent_id: str, call_id: str) -> None:
         """A message's file, fetched here and piped into the sandbox as bytes."""
         if not self._takes_pipes():
-            await self.hh.resolve_tool(
-                agent_id,
-                call_id,
-                error=(
-                    "this harness cannot hand a file to a sandbox: tool pipes "
-                    "arrived in protocol 4, and it speaks "
-                    f"{(self.hh.hello or {}).get('protocol')}"
-                ),
-            )
+            await self.hh.resolve_tool(agent_id, call_id, error=self._pipe_refusal())
             return
         arguments, complaint = download_arguments(event.get("arguments") or {})
         if complaint is not None:
@@ -595,6 +613,41 @@ class Bridge:
             arguments["path"],
         )
         await self._answer(agent_id, call_id, await download_to_sandbox(self.delivery, **arguments))
+
+    async def _clone_to_sandbox(self, event: dict, agent_id: str, call_id: str) -> None:
+        """A repository, cloned here and piped into the sandbox as one archive."""
+        if not self._takes_pipes():
+            await self.hh.resolve_tool(agent_id, call_id, error=self._pipe_refusal())
+            return
+        arguments, complaint = clone_arguments(event.get("arguments") or {})
+        if complaint is not None:
+            await self.hh.resolve_tool(agent_id, call_id, error=complaint)
+            return
+        log.info(
+            "cloning %s into sandbox %s at %s (%s commits deep)",
+            arguments["url"],
+            arguments["sandbox_id"],
+            arguments["path"],
+            arguments["depth"] or "all",
+        )
+        await self._answer(agent_id, call_id, await clone_to_sandbox(self.transfer, **arguments))
+
+    async def _curl_to_sandbox(self, event: dict, agent_id: str, call_id: str) -> None:
+        """A URL, fetched here and piped into the sandbox as its own file."""
+        if not self._takes_pipes():
+            await self.hh.resolve_tool(agent_id, call_id, error=self._pipe_refusal())
+            return
+        arguments, complaint = fetch_arguments(event.get("arguments") or {})
+        if complaint is not None:
+            await self.hh.resolve_tool(agent_id, call_id, error=complaint)
+            return
+        log.info(
+            "fetching %s into sandbox %s at %s",
+            arguments["url"],
+            arguments["sandbox_id"],
+            arguments["path"],
+        )
+        await self._answer(agent_id, call_id, await curl_to_sandbox(self.transfer, **arguments))
 
     def _forwarded(self, turn: _Turn, call_id: str, answer) -> None:
         """A message a tool put into the chat is the userbot's, like any other."""
@@ -646,6 +699,13 @@ class Bridge:
         """Whether the harness we are talking to can run a tool our answer names."""
         protocol = (self.hh.hello or {}).get("protocol")
         return isinstance(protocol, int) and protocol >= PIPE_PROTOCOL
+
+    def _pipe_refusal(self) -> str:
+        """What to tell the model when the harness is too old to carry a pipe."""
+        return (
+            "this harness cannot hand a file to a sandbox: tool pipes arrived in "
+            f"protocol 4, and it speaks {(self.hh.hello or {}).get('protocol')}"
+        )
 
     def _images(self, message: Incoming) -> list[str]:
         """The pictures to send with a fork: what this is about, and what it quotes."""

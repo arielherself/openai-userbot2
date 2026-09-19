@@ -11,6 +11,7 @@ from telethon import events
 from telethon.tl import types
 from telethon.tl.custom import Message as TgMessage
 
+from userbot import telegram
 from userbot.telegram import (
     MAX_FILE_BYTES,
     MAX_IMAGE_BYTES,
@@ -218,10 +219,12 @@ def test_a_file_too_big_to_hand_over_is_refused_before_it_is_fetched():
     asyncio.run(scenario())
 
 
-def test_a_file_that_turns_out_too_big_is_refused_too():
+def test_a_file_that_turns_out_too_big_is_refused_too(monkeypatch):
     async def scenario():
-        # the declared size lied, and what arrived is over the line
-        client = StubClient(payload=b"x" * (MAX_FILE_BYTES + 1))
+        # the declared size lied, and what arrived is over the line — a small
+        # stand-in for the cap, so the test does not move a real file's worth
+        monkeypatch.setattr(telegram, "MAX_FILE_BYTES", 1024)
+        client = StubClient(payload=b"x" * 1025)
         client.found = message(id=41, media=report_document(size=10))
         with pytest.raises(ValueError):
             await TelethonDelivery(client).download(-100, 41)

@@ -1,13 +1,18 @@
-"""Pieces the tests share: a scripted harness server and a fake Telegram."""
+"""Pieces the tests share: a scripted harness server, a fake Telegram, a server to fetch."""
 
 from __future__ import annotations
 
 import asyncio
 import json
+import threading
+import time
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from userbot.content import Content
+from userbot.harness import LINE_LIMIT
 from userbot.telegram import BotMessage, ChatMessage, ChatView, DownloadedFile
 
 DEFAULTS = {"endpoint": "https://provider.invalid/v1", "model": "fake-model", "has_key": True}
@@ -47,7 +52,9 @@ class FakeHarness:
         self._writers: list = []
 
     async def start(self) -> FakeHarness:
-        self._server = await asyncio.start_server(self._accept, self.host, 0)
+        # a piped payload is one line, and it can be a file's worth of base64 —
+        # the real server reads lines that long, so this one has to as well
+        self._server = await asyncio.start_server(self._accept, self.host, 0, limit=LINE_LIMIT)
         self.port = self._server.sockets[0].getsockname()[1]
         return self
 
@@ -358,3 +365,78 @@ class FakeFiles:
         self.asked.append({"message": message, "thumb": thumb})
         file.write(self.content)
         return file
+
+
+class FakeTransfer:
+    """A `Transfer` that answers with bytes instead of reaching the network.
+
+    It leaves behind what the real one leaves behind — a small checkout, or a
+    file, in the scratch directory it is handed — and remembers what it was
+    asked for, so a test can see that a clone or a fetch really happened.
+    """
+
+    def __init__(self, file: bytes = b"", fail: str = "") -> None:
+        self.file = file
+        self.fail = fail
+        self.cloned: list[tuple] = []
+        self.fetched: list[str] = []
+
+    async def clone(self, url, branch, depth, into):
+        self.cloned.append((url, branch, depth))
+        if self.fail:
+            raise RuntimeError(self.fail)
+        checkout = into / "repo"
+        (checkout / ".git").mkdir(parents=True)
+        (checkout / "README.md").write_bytes(self.file)
+        return checkout
+
+    async def fetch(self, url, into):
+        self.fetched.append(url)
+        if self.fail:
+            raise RuntimeError(self.fail)
+        target = into / "download"
+        target.write_bytes(self.file)
+        return target
+
+
+@contextmanager
+def serving(
+    body: bytes, chunks: int = 1, delay: float = 0.0, stall: float = 0.0, declare: bool = True
+):
+    """A local HTTP server for the real curl to fetch from.
+
+    `chunks` pieces are written with `delay` seconds between them, and no
+    `Content-Length` unless `declare` says the reply announces its own size — so
+    a test can choose between a size that is refused up front and one that only
+    a watch can stop. A `stall` answers nothing at all for that long.
+    """
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            try:
+                if stall:
+                    time.sleep(stall)
+                self.send_response(200)
+                if declare:
+                    self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                piece = max(1, len(body) // chunks)
+                for index in range(chunks):
+                    self.wfile.write(body[index * piece : (index + 1) * piece])
+                    self.wfile.flush()
+                    if delay and index < chunks - 1:
+                        time.sleep(delay)
+            except OSError:
+                pass  # the other end stopped listening: that is the point of a test
+
+        def log_message(self, *arguments):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}/payload.bin"
+    finally:
+        server.shutdown()
+        server.server_close()
