@@ -10,8 +10,9 @@ continue.
 Everything the agent says reaches the user through `tg_draft_response`. While the
 turn runs, one status message follows it, edited in place; when the reply goes out
 that message is deleted, and if the turn fails instead, the failure is reported
-back to the sender. A turn the network broke is the exception: it is run again,
-on a fresh block, before anything is reported.
+back to the sender. An attempt that did not get through — the network broke it, or
+the provider said "not now" — is the exception: it is run again, on a fresh block,
+before anything is reported.
 
 A message that replies to somebody else is quoted into the prompt, so the agent
 can see what is being talked about — text, and a placeholder for anything in it
@@ -90,9 +91,11 @@ IMAGE_PROTOCOL = 3
 # run next, which is how a file reaches a sandbox without passing through the model.
 PIPE_PROTOCOL = 4
 
-# How many times a turn that the network broke is run again before the failure is
-# reported. Each retry is a fresh block forked from the same parent: the attempt
-# that failed committed nothing, so there is nothing to continue from.
+# How many times a turn that did not get through is run again before the failure
+# is reported: the network broke it, or the provider turned the round away with a
+# status that means "not now". Each retry is a fresh block forked from the same
+# parent: the attempt that failed committed nothing, so there is nothing to
+# continue from.
 MAX_RETRIES = 5
 
 # How long to wait before a retry, doubling with every attempt so the tries
@@ -104,6 +107,12 @@ RETRY_DELAY_MAX = 8.0
 # The harness codes that mean the wire went away rather than the command being
 # wrong. Only those are worth another attempt; a refusal never is.
 RETRYABLE_CODES = frozenset({"not_connected", "unreachable", "connection_lost"})
+
+# The provider statuses that mean "not now" rather than "not this": a request that
+# timed out on their side, a rate limit, a wobble in their servers. Those are worth
+# asking again; every other refusal — a bad request, a bad key, no such model — is
+# the answer, and asking again would only reach it twice.
+RETRYABLE_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
 
 # Everything the agent can ask this userbot to do.
 LOCAL_TOOLS = [
@@ -362,15 +371,18 @@ class Bridge:
         await self._converse(message, task.agent_id)
 
     async def _converse(self, message: Incoming, parent: str) -> None:
-        """Run the turn for one message, and run it again when the network broke it.
+        """Run the turn for one message, and run it again when the attempt was lost.
 
-        Every attempt is a block of its own, forked from `parent`, so a retry is
-        the same message asked afresh: the attempt that failed committed nothing,
-        and is left where it is. What it did send is taken back first, or the
-        attempt that follows would send a second copy of it.
+        An attempt is worth repeating when the network broke it — the link to the
+        harness, or the socket under the provider call — or when the provider
+        turned the round away with a status that means "not now". Every attempt is
+        a block of its own, forked from `parent`, so a retry is the same message
+        asked afresh: the attempt that failed committed nothing, and is left where
+        it is. What it did send is taken back first, or the attempt that follows
+        would send a second copy of it.
 
-        A failure that is not the network's is reported at once — asking again
-        would only reach the same answer.
+        Any other failure is reported at once — asking again would only reach the
+        same answer twice.
         """
         tracker: StatusMessage | None = None
         for attempt in range(1, MAX_RETRIES + 2):
@@ -394,7 +406,7 @@ class Bridge:
                 await self._failure(message, turn.block if turn is not None else None, failure.text)
                 return
             log.warning(
-                "attempt %d for message %s met the network (%s); running it again",
+                "attempt %d for message %s did not get through (%s); running it again",
                 attempt,
                 message.message_id,
                 failure.text,
@@ -560,10 +572,11 @@ class Bridge:
         status = turn.status
         failure: str | None = None
         retryable = False
-        # A request that never reached a provider answer at all: the socket under
-        # the model call, rather than anything the provider said. That — and a
-        # harness link that died — is what another attempt could still get past.
-        transport = False
+        # Why this round could still be worth running again: the socket under the
+        # model call died before the provider answered, or the provider answered
+        # with a status that means "not now". Either is what another attempt gets
+        # past; anything else the turn dies of is the answer, not a hiccup.
+        transient = False
         self._turns[block] = turn
         subscription = self.hh.subscribe(f"agent:{block}")
         try:
@@ -594,7 +607,11 @@ class Bridge:
                     status.content += event.get("chars") or len(event.get("text") or "")
                     await turn.tracker.update(status)
                 elif name == "request_failed":
-                    transport = True
+                    transient = True
+                elif name == "response_received":
+                    # what the provider said, before the harness turns a refusal
+                    # into an error: a rate limit or a wobble is worth asking again
+                    transient = event.get("status") in RETRYABLE_STATUSES
                 elif name in ("tool_call_requested", "tool_call_started"):
                     status.tool(event.get("name", "?")).state = (
                         "queued" if name == "tool_call_requested" else "running"
@@ -617,7 +634,7 @@ class Bridge:
                     await turn.tracker.update(status)
                 elif name == "turn_failed":
                     status.phase = "failed"
-                    failure, retryable = _failure_reason(event), transport
+                    failure, retryable = _failure_reason(event), transient
                     status.error = _short(failure)
                     await turn.tracker.update(status, force=True)
                 elif name == "turn_cancelled":
@@ -634,7 +651,7 @@ class Bridge:
                         failure = _short(
                             event.get("error") or f"the agent ended with status {outcome!r}", 800
                         )
-                        retryable = transport
+                        retryable = transient
                     break
         finally:
             subscription.close()

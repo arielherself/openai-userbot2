@@ -8,6 +8,7 @@ import io
 import tarfile
 import time
 from datetime import datetime, timedelta
+from http import HTTPStatus
 
 from support import (
     FakeHarness,
@@ -446,13 +447,15 @@ class FlakyAgent(ScriptedAgent):
     """A harness whose first turns the network breaks.
 
     `transport_failures` turns die the way a provider socket does — a
-    `request_failed` round and a failed turn — and `hang_ups` turns really do
-    their work, and then lose the link before their end is reported.
+    `request_failed` round and a failed turn — `refusals` turns are turned away by
+    the provider with the statuses listed, and `hang_ups` turns really do their
+    work, and then lose the link before their end is reported.
     """
 
-    def __init__(self, transport_failures=0, hang_ups=0, **kwargs) -> None:
+    def __init__(self, transport_failures=0, refusals=(), hang_ups=0, **kwargs) -> None:
         super().__init__(**kwargs)
         self.transport_failures = transport_failures
+        self.refusals = list(refusals)
         self.hang_ups = hang_ups
         self.runs = 0
 
@@ -461,11 +464,54 @@ class FlakyAgent(ScriptedAgent):
         if self.runs <= self.transport_failures:
             await self._die_on_the_wire(conn, command)
             return
-        self.hang_up = self.runs <= self.transport_failures + self.hang_ups
+        refused = self.runs - self.transport_failures
+        if refused <= len(self.refusals):
+            await self._turned_away(conn, command, self.refusals[refused - 1])
+            return
+        self.hang_up = self.runs <= self.transport_failures + len(self.refusals) + self.hang_ups
         try:
             await super()._turn(conn, command)
         finally:
             self.hang_up = False
+
+    async def _turned_away(self, conn, command, status: int) -> None:
+        """One round the provider answered, with a status the harness turns into an error."""
+        block, rid = command["id"], command["rid"]
+        reason = HTTPStatus(status).phrase
+        error = f"{status} {reason}: {{'error': 'no'}}"
+        await conn.emit(event="run_accepted", rid=rid, agent_id=block, depth=1, context_len=1)
+        await conn.emit(
+            event="response_received",
+            agent_id=block,
+            round=1,
+            status=status,
+            reason=reason,
+            content_type="application/json",
+            elapsed_ms=2.0,
+        )
+        await conn.emit(
+            event="turn_failed",
+            agent_id=block,
+            error=error,
+            error_type="HHAgentError",
+            text="",
+            elapsed_ms=3.0,
+            context_len=1,
+            dirty=False,
+        )
+        await conn.emit(
+            event="command_finished",
+            rid=rid,
+            command="run",
+            agent_id=block,
+            status="error",
+            error=error,
+            error_type="HHAgentError",
+            dirty=False,
+            messages=1,
+            context_len=1,
+            state_committed=[],
+        )
 
     async def _die_on_the_wire(self, conn, command) -> None:
         """One round the provider's socket killed, as the real harness reports it."""
@@ -885,6 +931,59 @@ def test_a_turn_whose_link_died_is_run_again_and_its_reply_taken_back(tmp_path):
             statuses = [message for message in delivery.sent if message not in replies]
             assert len(statuses) == 2
             assert all((-100, (status["id"],)) in delivery.deleted for status in statuses)
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_provider_that_says_not_now_is_asked_again(tmp_path):
+    agent = FlakyAgent(refusals=[429])
+
+    async def scenario():
+        harness, delivery, store = await run_bridge(agent, mention(), tmp_path)
+        try:
+            # the provider rate-limited the first attempt; the second one answered
+            assert len(harness.commands_named("run")) == 2
+            forks = harness.commands_named("fork")
+            assert forks[0]["id"] == forks[1]["id"]
+            assert len(delivery.live()) == 1
+            assert delivery.live()[0]["text"] == "总结\n\n正文"
+            # nothing about it reached the sender
+            assert all("agent failed" not in message["text"] for message in delivery.live())
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_provider_refusal_that_is_not_transient_is_reported_at_once(tmp_path):
+    agent = FlakyAgent(refusals=[400])
+
+    async def scenario():
+        harness, delivery, store = await run_bridge(agent, mention(), tmp_path)
+        try:
+            # a bad request is the answer, not a hiccup: running it again would
+            # only be refused again
+            assert len(harness.commands_named("run")) == 1
+            notice = delivery.live()[-1]
+            assert "agent failed" in notice["text"]
+            assert "400 Bad Request" in notice["text"]
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_turn_with_a_server_side_wobble_is_asked_again(tmp_path):
+    agent = FlakyAgent(refusals=[503, 502])
+
+    async def scenario():
+        harness, delivery, store = await run_bridge(agent, mention(), tmp_path)
+        try:
+            assert len(harness.commands_named("run")) == 3
+            assert len(delivery.live()) == 1
+            assert delivery.live()[0]["text"] == "总结\n\n正文"
         finally:
             store.close()
 

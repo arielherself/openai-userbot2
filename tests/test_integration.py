@@ -90,6 +90,7 @@ async def drive(fixture, store, conversation, delivery=None) -> FakeTelegram:
             delivery,
             status_interval=0.0,
             identity=Identity(name="小助手", username="mybot", user_id=4242),
+            retry_delay=0.0,  # waiting between retries is not what these tests are about
         )
         for message in conversation:
             await bridge.handle(message)
@@ -319,7 +320,8 @@ def test_a_failed_turn_reports_itself_and_takes_the_reply_back(tmp_path):
             fixture.provider.tool_call(
                 "tg_draft_response", {"summary": "先发出去", "details": "这段会被撤回"}
             )
-            fixture.provider.error(status=500, body=b"the provider fell over")
+            # 400 is the answer, not a hiccup: the turn fails on its first try
+            fixture.provider.error(status=400, body=b"the provider refused the request")
             delivery = asyncio.run(drive(fixture, store, [mention()]))
 
             answer = delivery.sent[1]
@@ -334,6 +336,29 @@ def test_a_failed_turn_reports_itself_and_takes_the_reply_back(tmp_path):
             assert "agent failed" in failure["text"]
             assert failure["reply_to"] == 50
             assert store.lookup(CHAT, failure["id"]) is not None
+        finally:
+            store.close()
+
+
+def test_a_provider_wobble_is_asked_again_and_the_second_try_is_the_answer(tmp_path):
+    """A status that means "not now" costs a retry, not the user's answer."""
+    with Fixture(tmp_path) as fixture:
+        store = MappingStore(str(tmp_path / "mappings.db"))
+        try:
+            fixture.provider.error(status=503, body=b"the provider is having a moment")
+            # the retry gets a block of its own, so the provider is asked afresh
+            fixture.provider.tool_call(
+                "tg_draft_response", {"summary": "第二次", "details": "这次成了"}
+            )
+            fixture.provider.text("成了。")
+            delivery = asyncio.run(drive(fixture, store, [mention()]))
+
+            answers = [
+                message for message in delivery.live() if "agent failed" not in message["text"]
+            ]
+            assert [message["text"] for message in answers] == ["第二次\n\n这次成了"]
+            # one round refused, then the retry's own two rounds
+            assert len(fixture.provider.payloads()) == 3
         finally:
             store.close()
 
@@ -382,7 +407,8 @@ def test_a_turn_that_never_says_anything_leaves_no_status_message(tmp_path):
     with Fixture(tmp_path) as fixture:
         store = MappingStore(str(tmp_path / "mappings.db"))
         try:
-            fixture.provider.error(status=500, body=b"the provider fell over")
+            # 400 is the answer, not a hiccup: the turn fails on its first try
+            fixture.provider.error(status=400, body=b"the provider refused the request")
             delivery = asyncio.run(drive(fixture, store, [mention()]))
 
             assert len(delivery.sent) == 1  # just the failure notice
@@ -496,7 +522,8 @@ def test_a_failed_turn_takes_a_scheduled_task_back(tmp_path):
             fixture.provider.tool_call(
                 "tg_draft_response", {"summary": "先记下", "details": "这段会被撤回"}
             )
-            fixture.provider.error(status=500, body=b"the provider fell over")
+            # 400 is the answer, not a hiccup: the turn fails on its first try
+            fixture.provider.error(status=400, body=b"the provider refused the request")
             delivery = asyncio.run(drive(fixture, store, [mention()]))
 
             # the failed turn undid its work: the reply went back, and so did the task

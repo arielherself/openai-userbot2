@@ -442,20 +442,21 @@ auto-vacuum hands them back, so the file stays near the budget.
   too: the task it put on the list is cancelled again instead. A rollback reaches
   a pipe's own step like any other call: a file `tg_send_file` posted is deleted
   even though the model never made that call itself.
-- **A turn the network broke is run again.** Two things count as the network:
-  the link to the harness going away, and a provider request that never reached an
-  answer at all (the harness reports the round it lost). Either way the turn is
-  attempted again — up to five retries after the first try, waiting 1, 2, 4, 8 and
-  8 seconds so the tries outlast a blip — forked from the same parent block, since
-  the attempt that failed committed nothing. The failed attempt's status message
-  is followed into the retry rather than replaced, and whatever it managed to send
-  is taken back first, the way a rollback would have, so the retry does not leave a
-  second copy of it in the chat. A failure that is *not* the network's — a refusal
-  from the provider, a tool's own error, a turn that ran out of time — is reported
-  at once, because asking again would reach the same answer. The link to the
-  harness is also re-opened on its own (five tries, half a second apart) before a
-  command goes out, so a socket that died between two commands costs a reconnect
-  rather than a turn.
+- **An attempt that did not get through is run again.** Three things count: the
+  link to the harness going away; a provider request that never reached an answer
+  at all (the harness reports the round it lost); and a provider that answered with
+  a status that means "not now" — 408, 429, and 500/502/503/504. Either way the
+  turn is attempted again — up to five retries after the first try, waiting 1, 2,
+  4, 8 and 8 seconds so the tries outlast a blip — forked from the same parent
+  block, since the attempt that failed committed nothing. The failed attempt's
+  status message is followed into the retry rather than replaced, and whatever it
+  managed to send is taken back first, the way a rollback would have, so the retry
+  does not leave a second copy of it in the chat. Any other failure — a 400 or a
+  401 from the provider, a tool's own error, a protocol refusal from the harness, a
+  turn that ran out of time — is reported at once, because asking again would reach
+  the same answer. The link to the harness is also re-opened on its own (five tries,
+  half a second apart) before a command goes out, so a socket that died between two
+  commands costs a reconnect rather than a turn.
 - The tools that move a file between a chat and a sandbox declare what the move
   leaves behind. The ones going in — `tg_download_file_to_sandbox`,
   `git_clone_to_sandbox` and `curl_to_sandbox` — declare an external effect and no
