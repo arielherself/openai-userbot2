@@ -13,7 +13,9 @@ In a group it stays quiet unless it is addressed:
 
 While the agent works, one status message follows the turn (edited in place, so the
 chat is not spammed with progress). When the answer goes out, that message is
-deleted. If the turn fails, the failure is reported back to the sender instead.
+deleted. If the turn fails, the failure is reported back to the sender instead —
+unless it was the network that broke it, in which case the same message is run
+again first, on a fresh block, at most five times.
 
 ## How a turn looks
 
@@ -440,6 +442,20 @@ auto-vacuum hands them back, so the file stays near the budget.
   too: the task it put on the list is cancelled again instead. A rollback reaches
   a pipe's own step like any other call: a file `tg_send_file` posted is deleted
   even though the model never made that call itself.
+- **A turn the network broke is run again.** Two things count as the network:
+  the link to the harness going away, and a provider request that never reached an
+  answer at all (the harness reports the round it lost). Either way the turn is
+  attempted again — up to five retries after the first try, waiting 1, 2, 4, 8 and
+  8 seconds so the tries outlast a blip — forked from the same parent block, since
+  the attempt that failed committed nothing. The failed attempt's status message
+  is followed into the retry rather than replaced, and whatever it managed to send
+  is taken back first, the way a rollback would have, so the retry does not leave a
+  second copy of it in the chat. A failure that is *not* the network's — a refusal
+  from the provider, a tool's own error, a turn that ran out of time — is reported
+  at once, because asking again would reach the same answer. The link to the
+  harness is also re-opened on its own (five tries, half a second apart) before a
+  command goes out, so a socket that died between two commands costs a reconnect
+  rather than a turn.
 - The tools that move a file between a chat and a sandbox declare what the move
   leaves behind. The ones going in — `tg_download_file_to_sandbox`,
   `git_clone_to_sandbox` and `curl_to_sandbox` — declare an external effect and no

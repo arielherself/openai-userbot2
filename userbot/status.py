@@ -180,6 +180,19 @@ class StatusMessage:
         if self.store is not None and self.block and self.message_id is not None:
             self.store.record(self.chat_id, self.message_id, self.block)
 
+    def retarget(self, block: str) -> None:
+        """Follow another block from now on.
+
+        A turn that is run again keeps its one status message: the attempt that
+        failed is left behind, and the message traces its replacement instead.
+        One that was taken down — the attempt had already delivered a reply, which
+        the retry takes back — goes up again for the new attempt.
+        """
+        self.block = block
+        self.deleted = False
+        self._text, self._at = None, 0.0
+        self._remember()
+
     async def delete(self) -> None:
         """Take the status message down — the reply itself is the answer now."""
         message_id, self.message_id = self.message_id, None

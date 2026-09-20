@@ -37,6 +37,12 @@ LINE_LIMIT = ADD_FILE_BYTES * 4 // 3 + 2 * 1024 * 1024
 
 CONNECTION_LOST = "connection_lost"
 
+# A link that went away is opened again, this many times at most, with this long
+# between the tries: a socket cut while nobody was looking, or a harness that is
+# coming back up, is worth waiting out rather than failing a turn over.
+RECONNECT_ATTEMPTS = 5
+RECONNECT_DELAY = 0.5
+
 # What the agent uses to answer the user. It carries no implementation: the
 # server only needs the schema, and every call is answered from here.
 TG_DRAFT_TOOL = {
@@ -190,6 +196,30 @@ class HHClient:
         self._closed = True
         await self._teardown()
 
+    async def ensure_connected(self) -> None:
+        """Have a live link, opening one when the last one went away.
+
+        Every command goes through here, so a socket that died between two of
+        them — or while nobody was reading it — costs a reconnect rather than the
+        turn. A client that was closed on purpose stays closed.
+        """
+        if self.connected:
+            return
+        for attempt in range(1, RECONNECT_ATTEMPTS + 1):
+            try:
+                await self.connect()
+                return
+            except HarnessError as error:
+                if error.code == "closed" or attempt == RECONNECT_ATTEMPTS:
+                    raise
+                log.warning(
+                    "could not reconnect to %s:%s (%s); trying again",
+                    self.host,
+                    self.port,
+                    error,
+                )
+                await asyncio.sleep(RECONNECT_DELAY)
+
     async def _teardown(self) -> None:
         if self._reader_task is not None:
             self._reader_task.cancel()
@@ -272,15 +302,36 @@ class HHClient:
 
     # --- speaking -----------------------------------------------------------
     async def send(self, **command) -> str:
-        """Write one command; returns the rid it went out with."""
+        """Write one command; returns the rid it went out with.
+
+        The link is made good first, and a socket that looked alive and turned
+        out not to be is replaced and written to once more — so a caller only
+        hears about a harness it cannot reach at all.
+        """
         rid = command.setdefault("rid", self.next_rid())
         data = (json.dumps(command, ensure_ascii=False) + "\n").encode("utf-8")
         async with self._write_lock:
-            if not self.connected:
-                raise HarnessError("not_connected", f"no harness at {self.host}:{self.port}")
-            self._writer.write(data)
-            await self._writer.drain()
+            await self.ensure_connected()
+            try:
+                await self._write(data)
+            except OSError as error:
+                log.warning("the harness connection broke while writing: %s", error)
+                await self._teardown()
+                await self.ensure_connected()
+                try:
+                    await self._write(data)
+                except OSError as error:
+                    await self._teardown()
+                    raise HarnessError(
+                        "connection_lost", f"the harness went away: {error}"
+                    ) from error
         return rid
+
+    async def _write(self, data: bytes) -> None:
+        if not self.connected:
+            raise HarnessError("not_connected", f"no harness at {self.host}:{self.port}")
+        self._writer.write(data)
+        await self._writer.drain()
 
     def subscribe(self, *keys: str) -> Subscription:
         subscription = Subscription(self)

@@ -21,7 +21,7 @@ from support import (
     text_of,
 )
 
-from userbot.bridge import Bridge, Identity, Incoming
+from userbot.bridge import MAX_RETRIES, Bridge, Identity, Incoming
 from userbot.content import Content, Quoted
 from userbot.harness import HHClient
 from userbot.music import MUSIC_BOT, Gate
@@ -63,6 +63,9 @@ class ScriptedAgent:
         self.missing_details = missing_details
         self.missing_parent = missing_parent
         self.quiet = quiet  # never emits a delta: the turn produces nothing
+        # Die mid-turn instead of reporting how it ended, for the tests that need
+        # the link itself to be what breaks.
+        self.hang_up = False
         if calls is None:
             calls = []
             if draft:
@@ -334,6 +337,12 @@ class ScriptedAgent:
                 elapsed_ms=1.0,
                 **({"chain": chain, "steps": steps} if chain else {}),
             )
+        if self.hang_up:
+            # everything the turn had to do was done and delivered; the link goes
+            # before the client hears how it ended
+            conn.writer.close()
+            await asyncio.sleep(0)
+            return
         if self.fail:
             # a turn that does not commit is offered the undo of everything it did,
             # newest call first — the model's calls, and the client-run step a pipe
@@ -433,6 +442,69 @@ class ScriptedAgent:
             )
 
 
+class FlakyAgent(ScriptedAgent):
+    """A harness whose first turns the network breaks.
+
+    `transport_failures` turns die the way a provider socket does — a
+    `request_failed` round and a failed turn — and `hang_ups` turns really do
+    their work, and then lose the link before their end is reported.
+    """
+
+    def __init__(self, transport_failures=0, hang_ups=0, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.transport_failures = transport_failures
+        self.hang_ups = hang_ups
+        self.runs = 0
+
+    async def _turn(self, conn, command) -> None:
+        self.runs += 1
+        if self.runs <= self.transport_failures:
+            await self._die_on_the_wire(conn, command)
+            return
+        self.hang_up = self.runs <= self.transport_failures + self.hang_ups
+        try:
+            await super()._turn(conn, command)
+        finally:
+            self.hang_up = False
+
+    async def _die_on_the_wire(self, conn, command) -> None:
+        """One round the provider's socket killed, as the real harness reports it."""
+        block, rid = command["id"], command["rid"]
+        await conn.emit(event="run_accepted", rid=rid, agent_id=block, depth=1, context_len=1)
+        await conn.emit(
+            event="request_failed",
+            agent_id=block,
+            round=1,
+            error="('Connection aborted.', ConnectionResetError(104, 'reset by peer'))",
+            error_type="ConnectionError",
+            chunks=0,
+            elapsed_ms=2.0,
+        )
+        await conn.emit(
+            event="turn_failed",
+            agent_id=block,
+            error="stream from https://provider.invalid failed: connection reset",
+            error_type="HHAgentError",
+            text="",
+            elapsed_ms=3.0,
+            context_len=1,
+            dirty=False,
+        )
+        await conn.emit(
+            event="command_finished",
+            rid=rid,
+            command="run",
+            agent_id=block,
+            status="error",
+            error="stream from https://provider.invalid failed: connection reset",
+            error_type="HHAgentError",
+            dirty=False,
+            messages=1,
+            context_len=1,
+            state_committed=[],
+        )
+
+
 def mention(message_id=50, text="你好 @bot", media="") -> Incoming:
     return Incoming(
         chat_id=-100,
@@ -493,6 +565,7 @@ async def run_bridge(
         identity=identity,
         music_gate=music_gate,
         transfer=transfer,
+        retry_delay=0.0,  # the waiting between retries is not what is under test
     )
     try:
         await bridge.handle(message)
@@ -754,6 +827,97 @@ def test_a_failure_after_the_reply_takes_the_reply_back(tmp_path):
             assert "the provider hung up" in failure["text"]
             # the failure message is mapped too, so a reply to it continues on
             assert store.lookup(-100, failure["id"]) == harness.commands_named("fork")[0]["new_id"]
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_turn_the_providers_socket_killed_is_run_again(tmp_path):
+    agent = FlakyAgent(transport_failures=1)
+
+    async def scenario():
+        harness, delivery, store = await run_bridge(agent, mention(), tmp_path)
+        try:
+            # the first attempt died on the wire and the second one answered — and
+            # both forks came off the same parent, so the retry is the same message
+            forks = harness.commands_named("fork")
+            assert len(forks) == len(harness.commands_named("run")) == 2
+            assert forks[0]["id"] == forks[1]["id"]
+            assert forks[0]["prompt"] == forks[1]["prompt"]
+
+            # the sender hears nothing about the attempt that failed: one status
+            # message, taken down, and the reply that replaced it
+            status, answer = delivery.sent
+            assert delivery.deleted == [(-100, (status["id"],))]
+            assert delivery.live() == [answer]
+            assert answer["text"] == "总结\n\n正文"
+            assert answer["reply_to"] == 50
+            assert store.lookup(-100, answer["id"]) == forks[1]["new_id"]
+            # and that block is the one the retry ran, not the one it replaced
+            assert forks[0]["new_id"] != forks[1]["new_id"]
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_turn_whose_link_died_is_run_again_and_its_reply_taken_back(tmp_path):
+    agent = FlakyAgent(hang_ups=1)
+
+    async def scenario():
+        harness, delivery, store = await run_bridge(agent, mention(), tmp_path)
+        try:
+            assert len(harness.commands_named("run")) == 2
+            # the client opened a fresh link instead of failing the message
+            assert len(harness.connections) == 2
+
+            # the attempt that lost the link had already answered the sender; that
+            # answer is taken back, or the retry would leave two of them standing
+            replies = [message for message in delivery.sent if message["text"].startswith("总结")]
+            assert len(replies) == 2  # one per attempt
+            assert (-100, (replies[0]["id"],)) in delivery.deleted
+            assert store.lookup(-100, replies[0]["id"]) is None
+            assert delivery.live() == [replies[1]]
+
+            # each attempt had a status message, and neither is left standing: the
+            # first went down with the reply it delivered, the second with the retry's
+            statuses = [message for message in delivery.sent if message not in replies]
+            assert len(statuses) == 2
+            assert all((-100, (status["id"],)) in delivery.deleted for status in statuses)
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_turn_is_given_up_on_after_five_retries(tmp_path):
+    agent = FlakyAgent(transport_failures=MAX_RETRIES + 1)
+
+    async def scenario():
+        harness, delivery, store = await run_bridge(agent, mention(), tmp_path)
+        try:
+            # one try and five retries, and then the sender is told
+            assert len(harness.commands_named("run")) == MAX_RETRIES + 1
+            notice = delivery.live()[-1]
+            assert notice["reply_to"] == 50
+            assert "agent failed" in notice["text"]
+            assert "connection reset" in notice["text"]
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_failure_that_is_not_the_network_is_reported_at_once(tmp_path):
+    agent = ScriptedAgent(fail=True)
+
+    async def scenario():
+        harness, delivery, store = await run_bridge(agent, mention(), tmp_path)
+        try:
+            # the wire was fine: running the turn again would reach the same answer
+            assert len(harness.commands_named("run")) == 1
+            assert "agent failed" in delivery.live()[-1]["text"]
         finally:
             store.close()
 

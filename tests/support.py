@@ -71,6 +71,13 @@ class FakeHarness:
             pass
         await asyncio.sleep(0)
 
+    async def drop(self) -> None:
+        """Hang up on every client, and stay listening for the next one."""
+        for writer in self._writers:
+            writer.close()
+        self._writers.clear()
+        await asyncio.sleep(0)
+
     async def _accept(self, reader, writer) -> None:
         conn = Conn(writer)
         self.connections.append(conn)

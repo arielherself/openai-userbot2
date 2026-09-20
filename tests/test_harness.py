@@ -153,3 +153,57 @@ def test_a_lost_connection_wakes_every_subscription():
         await client.close()
 
     asyncio.run(scenario())
+
+
+def test_a_connection_that_went_away_is_opened_again():
+    async def scenario():
+        harness = await FakeHarness(script).start()
+        client = HHClient(harness.host, harness.port)
+        await client.connect()
+        try:
+            first = await client.command(command="ping", echo="hello")
+            assert first["pong"]["echo"] == "hello"
+            await harness.drop()
+            for _ in range(100):  # the reader notices the hang-up on its own
+                if not client.connected:
+                    break
+                await asyncio.sleep(0.01)
+            assert not client.connected
+            # the next command opens a fresh link instead of failing on the old one
+            again = await client.command(command="ping", echo="again")
+            assert again["pong"]["echo"] == "again"
+            assert len(harness.connections) == 2
+        finally:
+            await client.close()
+            await harness.stop()
+
+    asyncio.run(scenario())
+
+
+def test_a_write_that_finds_the_socket_gone_is_made_again():
+    async def scenario():
+        harness = await FakeHarness(script).start()
+        client = HHClient(harness.host, harness.port)
+        await client.connect()
+        try:
+            # the socket looked alive until the write reached it — the way it is
+            # when a peer vanishes without the reader having noticed yet
+            writes, real = [], client._write
+
+            async def failing_once(data):
+                writes.append(data)
+                if len(writes) == 1:
+                    raise ConnectionResetError("the peer went away")
+                await real(data)
+
+            client._write = failing_once
+            found = await client.command(command="ping", echo="again")
+            assert found["pong"]["echo"] == "again"
+            assert len(writes) == 2
+            # and it went out over a fresh link, not the one that just failed
+            assert len(harness.connections) == 2
+        finally:
+            await client.close()
+            await harness.stop()
+
+    asyncio.run(scenario())

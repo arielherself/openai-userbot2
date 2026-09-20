@@ -10,7 +10,8 @@ continue.
 Everything the agent says reaches the user through `tg_draft_response`. While the
 turn runs, one status message follows it, edited in place; when the reply goes out
 that message is deleted, and if the turn fails instead, the failure is reported
-back to the sender.
+back to the sender. A turn the network broke is the exception: it is run again,
+on a fresh block, before anything is reported.
 
 A message that replies to somebody else is quoted into the prompt, so the agent
 can see what is being talked about — text, and a placeholder for anything in it
@@ -88,6 +89,21 @@ IMAGE_PROTOCOL = 3
 # The protocol that carries a tool pipe: a local tool answering with the tool to
 # run next, which is how a file reaches a sandbox without passing through the model.
 PIPE_PROTOCOL = 4
+
+# How many times a turn that the network broke is run again before the failure is
+# reported. Each retry is a fresh block forked from the same parent: the attempt
+# that failed committed nothing, so there is nothing to continue from.
+MAX_RETRIES = 5
+
+# How long to wait before a retry, doubling with every attempt so the tries
+# spread over a blip rather than spending themselves in the first second of one,
+# and never waiting longer than this.
+RETRY_DELAY = 1.0
+RETRY_DELAY_MAX = 8.0
+
+# The harness codes that mean the wire went away rather than the command being
+# wrong. Only those are worth another attempt; a refusal never is.
+RETRYABLE_CODES = frozenset({"not_connected", "unreachable", "connection_lost"})
 
 # Everything the agent can ask this userbot to do.
 LOCAL_TOOLS = [
@@ -254,6 +270,14 @@ def _failure_reason(event: dict) -> str:
 
 
 @dataclass
+class _Failure:
+    """Why an attempt did not deliver, and whether trying again could help."""
+
+    text: str
+    retryable: bool = False
+
+
+@dataclass
 class _Turn:
     """What one running turn needs to keep track of."""
 
@@ -265,6 +289,9 @@ class _Turn:
     started: float = 0.0
     sent: list[int] = field(default_factory=list)
     delivered: bool = False
+    # Why the turn did not deliver, when it failed — the bridge decides from this
+    # whether to report it or ask again.
+    failure: _Failure | None = None
     # What a rollback would have to delete, per local call: the messages a call
     # put into the chat, keyed by that call's id.
     effects: dict[str, list[int]] = field(default_factory=dict)
@@ -285,6 +312,7 @@ class Bridge:
         identity: Identity | None = None,
         music_gate: Gate | None = None,
         transfer: Transfer | None = None,
+        retry_delay: float = RETRY_DELAY,
     ) -> None:
         self.hh = harness
         self.store = store
@@ -293,6 +321,8 @@ class Bridge:
         self.turn_timeout = turn_timeout
         self.model = model
         self.identity = identity
+        # how long to wait before running a turn the network broke again
+        self.retry_delay = retry_delay
         # one gate for the whole userbot: the music bot is shared between chats
         self.music_gate = music_gate if music_gate is not None else Gate()
         # where a clone or a URL is fetched, on this side of the wire
@@ -317,16 +347,7 @@ class Bridge:
                 "message %s in chat %s is not addressed to us", message.message_id, message.chat_id
             )
             return
-        block = None
-        try:
-            block, forked_from = await self._fork(message, parent)
-            await self._turn(message, block, forked_from)
-        except HarnessError as error:
-            log.warning("the harness refused the turn for %s: %s", message.message_id, error)
-            await self._failure(message, block, str(error))
-        except Exception as error:
-            log.exception("the turn for %s broke", message.message_id)
-            await self._failure(message, block, f"internal error: {error}")
+        await self._converse(message, parent)
 
     async def fire(self, task: Schedule) -> None:
         """Run one task that has come due: its text goes to the agent, the answer here."""
@@ -338,16 +359,73 @@ class Bridge:
             sender_name="a scheduled task",
             scheduled=True,
         )
-        block = None
-        try:
-            block, forked_from = await self._fork(message, task.agent_id)
-            await self._turn(message, block, forked_from)
-        except HarnessError as error:
-            log.warning("the harness refused the scheduled task %s: %s", task.id, error)
-            await self._failure(message, block, str(error))
-        except Exception as error:
-            log.exception("the scheduled task %s broke", task.id)
-            await self._failure(message, block, f"internal error: {error}")
+        await self._converse(message, task.agent_id)
+
+    async def _converse(self, message: Incoming, parent: str) -> None:
+        """Run the turn for one message, and run it again when the network broke it.
+
+        Every attempt is a block of its own, forked from `parent`, so a retry is
+        the same message asked afresh: the attempt that failed committed nothing,
+        and is left where it is. What it did send is taken back first, or the
+        attempt that follows would send a second copy of it.
+
+        A failure that is not the network's is reported at once — asking again
+        would only reach the same answer.
+        """
+        tracker: StatusMessage | None = None
+        for attempt in range(1, MAX_RETRIES + 2):
+            turn, failure = None, None
+            try:
+                block, forked_from = await self._fork(message, parent)
+                turn = await self._turn(message, block, forked_from, tracker)
+            except HarnessError as error:
+                log.warning("the harness refused the turn for %s: %s", message.message_id, error)
+                failure = _Failure(str(error), error.code in RETRYABLE_CODES)
+            except Exception as error:
+                log.exception("the turn for %s broke", message.message_id)
+                failure = _Failure(f"internal error: {error}")
+
+            if turn is not None:
+                tracker = turn.tracker
+                failure = turn.failure
+            if failure is None:
+                return
+            if not failure.retryable or attempt > MAX_RETRIES:
+                await self._failure(message, turn.block if turn is not None else None, failure.text)
+                return
+            log.warning(
+                "attempt %d for message %s met the network (%s); running it again",
+                attempt,
+                message.message_id,
+                failure.text,
+            )
+            if turn is not None:
+                await self._take_back(turn)
+            if self.retry_delay:
+                await asyncio.sleep(min(self.retry_delay * 2 ** (attempt - 1), RETRY_DELAY_MAX))
+
+    async def _take_back(self, turn: _Turn) -> None:
+        """Undo what an attempt that will not be carried on has left behind.
+
+        The harness rolls a failed turn back itself, but a turn whose connection
+        died never got the chance to: whatever it put into the chat is still
+        there, and the attempt that follows would put a second copy beside it.
+        """
+        messages = list(turn.sent)
+        for sent in turn.effects.values():
+            messages += sent
+        turn.sent, turn.delivered = [], False
+        turn.effects.clear()
+        for task_id in turn.scheduled.values():
+            self.store.remove_schedule(task_id)
+        turn.scheduled.clear()
+        if messages:
+            unique = list(dict.fromkeys(messages))
+            self.store.forget(turn.message.chat_id, unique)
+            try:
+                await self.delivery.delete(turn.message.chat_id, unique)
+            except Exception as error:
+                log.warning("could not take back what the failed attempt sent: %s", error)
 
     async def _inspect(self, message: Incoming) -> None:
         """Answer `/inspect`: what the turn behind the replied-to message is doing."""
@@ -448,24 +526,44 @@ class Bridge:
             return block, fields["id"]
 
     # --- running the turn ----------------------------------------------------
-    async def _turn(self, message: Incoming, block: str, parent: str) -> None:
-        turn = _Turn(
-            message=message,
-            block=block,
-            parent=parent,
-            status=TurnStatus(),
-            tracker=StatusMessage(
+    async def _turn(
+        self,
+        message: Incoming,
+        block: str,
+        parent: str,
+        tracker: StatusMessage | None = None,
+    ) -> _Turn:
+        """Run this block's turn to its end, and report what became of it.
+
+        `tracker`, when given, is the status message of the attempt this one
+        replaces, so a turn that is run again keeps the one message following it.
+        """
+        if tracker is None:
+            tracker = StatusMessage(
                 self.delivery,
                 message.chat_id,
                 message.message_id,
                 self.status_interval,
                 store=self.store,
                 block=block,
-            ),
+            )
+        else:
+            tracker.retarget(block)
+        turn = _Turn(
+            message=message,
+            block=block,
+            parent=parent,
+            status=TurnStatus(),
+            tracker=tracker,
             started=time.monotonic(),
         )
         status = turn.status
         failure: str | None = None
+        retryable = False
+        # A request that never reached a provider answer at all: the socket under
+        # the model call, rather than anything the provider said. That — and a
+        # harness link that died — is what another attempt could still get past.
+        transport = False
         self._turns[block] = turn
         subscription = self.hh.subscribe(f"agent:{block}")
         try:
@@ -484,6 +582,7 @@ class Bridge:
 
                 if name == CONNECTION_LOST:
                     failure = "the connection to the agent harness was lost"
+                    retryable = True
                     break
                 if name in ("run_accepted", "turn_started"):
                     status.phase = "thinking"
@@ -494,6 +593,8 @@ class Bridge:
                 elif name == "content_delta":
                     status.content += event.get("chars") or len(event.get("text") or "")
                     await turn.tracker.update(status)
+                elif name == "request_failed":
+                    transport = True
                 elif name in ("tool_call_requested", "tool_call_started"):
                     status.tool(event.get("name", "?")).state = (
                         "queued" if name == "tool_call_requested" else "running"
@@ -516,7 +617,7 @@ class Bridge:
                     await turn.tracker.update(status)
                 elif name == "turn_failed":
                     status.phase = "failed"
-                    failure = _failure_reason(event)
+                    failure, retryable = _failure_reason(event), transport
                     status.error = _short(failure)
                     await turn.tracker.update(status, force=True)
                 elif name == "turn_cancelled":
@@ -533,6 +634,7 @@ class Bridge:
                         failure = _short(
                             event.get("error") or f"the agent ended with status {outcome!r}", 800
                         )
+                        retryable = transport
                     break
         finally:
             subscription.close()
@@ -541,12 +643,11 @@ class Bridge:
         if failure is not None:
             status.phase = "failed"
             status.error = status.error or _short(failure)
+            turn.failure = _Failure(_short(failure, 800), retryable)
         elif status.phase == "done" and not turn.delivered:
             status.note = "no reply was drafted"
         await turn.tracker.update(status, force=True)
-
-        if failure is not None:
-            await self._failure(message, block, failure)
+        return turn
 
     # --- the local tools -----------------------------------------------------
     async def _local_call(self, turn: _Turn, event: dict) -> None:
