@@ -22,18 +22,17 @@ again first, on a fresh block, at most five times.
 ```
 you  ▶ @mybot 帮我把这段话翻译成英文：今天天气不错
 
-bot  ▶ 🧠 thinking · 1,234 chars                   ← thinking has started; followed live with --status-thinking
+bot  ▶ 🧠 thinking                                 ← the turn is under way; --status-thinking shows the trace
 bot  ▶ 今天天气不错 → The weather is nice today.   ← the summary, a reply in itself
        ┃ The weather is nice today.                ← details, collapsed blockquote
 ```
 
-The status message is a trace of the turn rather than a sentence: the phase, how
-much thinking there has been, and which tool is being called — never its
-arguments or its result. The thinking count is the one part that is **opt-in**:
-the first reasoning chunk always opens the message, so the turn is visibly under
-way, but after that the count does not edit it — it rides along with whatever
-update comes next, and `--status-thinking` makes the growing count drive the
-edits instead. Everything else becomes a line of its own below:
+The status message is not a sentence: by default it is the bare `🧠 thinking`,
+opened by the first reasoning chunk so the turn is visibly under way, and left
+alone until it ends — no char counts, no tool calls. `--status-thinking` makes it
+the turn's **trace** instead: how much thinking there has been, which tool is
+being called, how much drafting — never a tool's arguments or its result. With
+the trace on, everything becomes a line of its own below:
 
 ```
 🧠 thinking · 900 chars
@@ -48,10 +47,11 @@ turns into `✅ <name>` or `❌ <name> failed (error)`. The turn ends on one of
 
 For as long as it stands, the tracking message is recorded against the block it
 is tracking, so replying to it with **`/inspect`** prints what the turn is doing
-— the block it runs in, the same trace with nothing clipped, and where the reply
-stands. That mapping is as temporary as the message: deleting the message drops
-it, and the answer to `/inspect` is a message of the userbot's like any other, so
-it can be asked about in turn. `/inspect` never starts a turn of its own.
+— the block it runs in, the full trace of the turn with nothing clipped, and
+where the reply stands. That mapping is as temporary as the message: deleting it
+drops the mapping, and the answer to `/inspect` is a message of the userbot's
+like any other, so it can be asked about in turn. `/inspect` never starts a turn
+of its own.
 
 It appears only when the harness has actually produced something — a reasoning
 chunk, a tool call, the start of a draft — so a turn that is accepted and then
@@ -415,7 +415,7 @@ uv run python -m userbot --harness-port 8765 --db userbot.db
 | `--db` | `USERBOT_DB` | `userbot.db` | the mapping store |
 | `--max-db-bytes` | `USERBOT_MAX_DB_BYTES` | 8 MiB | budget for that store |
 | `--status-interval` | `USERBOT_STATUS_INTERVAL` | `2.0` | minimum seconds between status edits |
-| `--status-thinking` | `USERBOT_STATUS_THINKING` | off | let the thinking char count edit the status message as it grows |
+| `--status-thinking` | `USERBOT_STATUS_THINKING` | off | show the turn's trace — thinking, tool calls, drafting — in the status message |
 | `--turn-timeout` | `USERBOT_TURN_TIMEOUT` | `3600` | give up on a turn after this long |
 | `--log-level` | `USERBOT_LOG_LEVEL` | `INFO` | logging |
 

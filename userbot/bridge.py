@@ -338,7 +338,7 @@ class Bridge:
         self.store = store
         self.delivery = delivery
         self.status_interval = status_interval
-        # whether the thinking char count edits the status message as it grows
+        # whether the status message carries the turn's trace or just `🧠 thinking`
         self.status_thinking = status_thinking
         self.turn_timeout = turn_timeout
         self.model = model
@@ -573,6 +573,7 @@ class Bridge:
                 self.status_interval,
                 store=self.store,
                 block=block,
+                trace=self.status_thinking,
             )
         else:
             tracker.retarget(block)
@@ -616,14 +617,12 @@ class Bridge:
                     status.phase = "thinking"
                     await turn.tracker.update(status)
                 elif name == "reasoning_delta":
-                    # The first chunk always opens the status message — the user
-                    # has to see that the turn is under way — but after that the
-                    # count edits it only with `status_thinking`; otherwise it
-                    # just accumulates, and a later update carries the total.
-                    first = not status.reasoning
+                    # The count is always gathered — for the trace and for
+                    # `/inspect` — but whether it reaches the status message is
+                    # the render's own choice: a bare message renders the same
+                    # text through every chunk, so only the first one lands.
                     status.reasoning += event.get("chars") or len(event.get("text") or "")
-                    if self.status_thinking or first:
-                        await turn.tracker.update(status)
+                    await turn.tracker.update(status)
                 elif name == "content_delta":
                     status.content += event.get("chars") or len(event.get("text") or "")
                     await turn.tracker.update(status)

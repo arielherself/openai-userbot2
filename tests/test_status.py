@@ -142,3 +142,33 @@ def test_a_long_tool_error_is_kept_short():
     line = next(line for line in status.render().splitlines() if "tg_search_music" in line)
     assert line.startswith("❌ tg_search_music failed (could not reach the music bot: ")
     assert "…" in line and len(line) < 120
+
+
+def test_a_bare_status_is_only_the_headline():
+    status = TurnStatus(phase="thinking", reasoning=1234, content=56)
+    status.tool("web_search").state = "ok"
+    assert status.render(trace=False) == "🧠 thinking"
+    # the end of the turn is still told, and the failure still says why
+    status.phase = "failed"
+    status.error = "provider hung up"
+    assert status.render(trace=False) == "❌ failed\n⚠️ error · provider hung up"
+    # the full render keeps everything
+    assert "1,234" in status.render()
+
+
+def test_a_bare_tracker_keeps_the_thinking_line_still():
+    async def scenario():
+        delivery = FakeTelegram()
+        tracker = StatusMessage(delivery, chat_id=-1, reply_to=7, min_interval=0, trace=False)
+        status = TurnStatus(phase="thinking", reasoning=12)
+        await tracker.update(status)
+        assert delivery.sent[0]["text"] == "🧠 thinking"
+
+        # none of the trace that follows edits the message
+        status.reasoning = 900
+        status.content = 56
+        status.tool("web_search")
+        await tracker.update(status, force=True)
+        assert delivery.edits == []
+
+    asyncio.run(scenario())

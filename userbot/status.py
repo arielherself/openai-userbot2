@@ -8,8 +8,10 @@ after the last is dropped, and the end of the turn is always published.
 
 What it says is deliberately bare — `🧠 thinking`, `🔧 calling web_search`,
 `✅ done` — rather than a sentence addressed to the reader: it is a trace of the
-turn, not a reply. The thinking itself is never repeated here, only how much of
-it there has been; a tool call is named, never its arguments or its result.
+turn, not a reply. By default the message is only the bare headline; a tracker
+given `trace=True` carries the rest of the turn — how much thinking and drafting
+there has been, and which tool is being called. The thinking itself is never
+repeated, only counted; a tool call is named, never its arguments or its result.
 """
 
 from __future__ import annotations
@@ -89,10 +91,16 @@ class TurnStatus:
                 lines.append(f"❌ {tool.name}: {tool.detail}")
         return "\n".join(lines)
 
-    def render(self) -> str:
+    def render(self, trace: bool = True) -> str:
+        """The message, or — with `trace` off — only the state the turn is in.
+
+        The trace is what the turn is doing: how much thinking and drafting there
+        has been, and which tool is being called. Without it the message is the
+        bare headline, closed with the error when the turn failed.
+        """
         headline = HEADLINES.get(self.phase, THINKING)
         body = []
-        if self.reasoning:
+        if trace and self.reasoning:
             # While the agent is thinking, its count is what the headline is about,
             # so it goes on that line; once the turn has an outcome of its own, the
             # count becomes a line of its own instead.
@@ -101,8 +109,9 @@ class TurnStatus:
                 headline = thinking
             else:
                 body.append(thinking)
-        body.extend(tool_line(tool) for tool in self.tools[-TOOL_LINES:])
-        if self.content:
+        if trace:
+            body.extend(tool_line(tool) for tool in self.tools[-TOOL_LINES:])
+        if trace and self.content:
             body.append(f"✍️ drafting · {self.content:,} chars")
         if self.phase == "failed" and self.error:
             body.append(f"⚠️ error · {self.error}")
@@ -127,6 +136,7 @@ class StatusMessage:
         min_interval: float = 2.0,
         store=None,
         block: str | None = None,
+        trace: bool = True,
     ) -> None:
         self.delivery = delivery
         self.chat_id = chat_id
@@ -134,6 +144,8 @@ class StatusMessage:
         self.min_interval = min_interval
         self.store = store
         self.block = block
+        # whether the message carries the turn's trace or only its headline
+        self.trace = trace
         self.message_id: int | None = None
         self.deleted = False
         self._text: str | None = None
@@ -148,7 +160,7 @@ class StatusMessage:
             return
         if self.message_id is None and not status.active:
             return  # the agent has not produced anything yet: nothing to show
-        text = status.render()
+        text = status.render(trace=self.trace)
         if text == self._text:
             return
         if self.message_id is None:

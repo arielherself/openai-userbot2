@@ -117,7 +117,7 @@ class Config:
             "--status-thinking",
             action="store_true",
             default=_env_bool("USERBOT_STATUS_THINKING", False),
-            help="edit the status message as the thinking char count grows (default: off)",
+            help="show the turn's trace — thinking, tool calls, drafting — in the status message",
         )
         parser.add_argument(
             "--turn-timeout",

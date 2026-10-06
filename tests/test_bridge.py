@@ -1052,26 +1052,24 @@ def test_a_failure_before_the_reply_leaves_the_status_saying_so(tmp_path):
     asyncio.run(scenario())
 
 
-def test_the_first_thinking_chunk_opens_the_status_by_default(tmp_path):
+def test_by_default_the_status_is_only_the_thinking_line(tmp_path):
     agent = ScriptedAgent(reasoning_chunks=2)
 
     async def scenario():
         _, delivery, store = await run_bridge(agent, mention(), tmp_path)
         try:
-            # the user sees the turn is under way the moment it starts thinking
-            assert delivery.sent[0]["text"] == "🧠 thinking · 3 chars"
-            # but the second chunk did not edit the message: its count (6) only
-            # rode along when the draft call touched the status
-            assert delivery.edits[0]["text"].startswith(
-                "🧠 thinking · 6 chars\n🔧 calling tg_draft_response"
-            )
+            # the first chunk opens the message so the turn is visibly under way...
+            assert delivery.sent[0]["text"] == "🧠 thinking"
+            # ...and nothing of the trace follows it: no chars, no tool call
+            assert delivery.edits == []
+            assert delivery.deleted == [(-100, (delivery.sent[0]["id"],))]
         finally:
             store.close()
 
     asyncio.run(scenario())
 
 
-def test_the_thinking_count_edits_the_status_when_asked(tmp_path):
+def test_the_full_trace_follows_when_asked(tmp_path):
     agent = ScriptedAgent(reasoning_chunks=2)
 
     async def scenario():
@@ -1080,8 +1078,10 @@ def test_the_thinking_count_edits_the_status_when_asked(tmp_path):
         )
         try:
             assert delivery.sent[0]["text"] == "🧠 thinking · 3 chars"
-            # with the option on, the next chunk edits the message by itself
+            # with the option on, the count follows every chunk...
             assert delivery.edits[0]["text"] == "🧠 thinking · 6 chars"
+            # ...and the tool call gets its line
+            assert delivery.edits[1]["text"].endswith("🔧 calling tg_draft_response")
         finally:
             store.close()
 
@@ -1360,6 +1360,7 @@ def test_the_status_message_names_the_music_tool(tmp_path):
             mention(),
             tmp_path,
             delivery_ready=answer_music({"/search": {"text": "🎶 结果", "has_buttons": True}}),
+            status_thinking=True,  # tool lines need the trace
         )
         try:
             assert any("tg_search_music" in edit["text"] for edit in delivery.edits)
@@ -1378,7 +1379,8 @@ def test_a_music_failure_reaches_the_agent_as_a_tool_error(tmp_path):
     )
 
     async def scenario():
-        _, delivery, store = await run_bridge(agent, mention(), tmp_path)  # the bot never answers
+        # the bot never answers; tool lines need the trace
+        _, delivery, store = await run_bridge(agent, mention(), tmp_path, status_thinking=True)
         try:
             assert agent.outcomes["call_1"] is False
             assert "said nothing within" in agent.answer_for("call_1")["error"]
