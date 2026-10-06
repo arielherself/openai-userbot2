@@ -13,7 +13,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from userbot.content import Content
 from userbot.harness import LINE_LIMIT
-from userbot.telegram import BotMessage, ChatMessage, ChatView, DownloadedFile
+from userbot.telegram import (
+    BotMessage,
+    ChatMessage,
+    ChatView,
+    DownloadedFile,
+    InlineEntry,
+    InlineMenu,
+)
 
 DEFAULTS = {"endpoint": "https://provider.invalid/v1", "model": "fake-model", "has_key": True}
 
@@ -145,6 +152,13 @@ class FakeTelegram:
         self.files: dict[tuple, bytes] = {}
         self.fail_download = False
         self.downloaded: list[tuple] = []
+        # What a bot's inline menu offers, for the inline tools: (bot, query) ->
+        # the entries, as dicts of title/description/type or InlineEntry objects.
+        self.inline: dict[tuple, list] = {}
+        self.inline_queries: list[dict] = []
+        self.inline_sent: list[dict] = []
+        self.fail_inline = False
+        self.fail_inline_send = False
         self._next_id = 1000
         self._listeners: list[tuple] = []
 
@@ -243,6 +257,41 @@ class FakeTelegram:
         self._next_id += 1
         self.forwarded.append(
             {"id": self._next_id, "from": chat_id, "message_id": message_id, "to": to_chat_id}
+        )
+        return self._next_id
+
+    async def inline_query(self, bot, query) -> InlineMenu:
+        """What that bot offers for that query, as the tests scripted it."""
+        self.inline_queries.append({"bot": bot, "query": query})
+        if self.fail_inline:
+            raise RuntimeError("telegram said no")
+        try:
+            offered = self.inline[(bot, query)]
+        except KeyError:
+            raise ValueError(f"no inline menu for {bot} asking {query!r}") from None
+        return InlineMenu(
+            bot=bot,
+            query=query,
+            entries=[
+                entry if isinstance(entry, InlineEntry) else InlineEntry(**entry)
+                for entry in offered
+            ],
+        )
+
+    async def send_inline(self, menu, index, chat_id) -> int:
+        """The pick "goes out": recorded, with the id it became."""
+        if self.fail_inline_send:
+            raise RuntimeError("telegram said no")
+        self._next_id += 1
+        self.inline_sent.append(
+            {
+                "id": self._next_id,
+                "chat_id": chat_id,
+                "bot": menu.bot,
+                "query": menu.query,
+                "index": index,
+                "title": menu.entries[index].title,
+            }
         )
         return self._next_id
 

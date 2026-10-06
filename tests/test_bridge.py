@@ -22,6 +22,7 @@ from support import (
     text_of,
 )
 
+from userbot import inline
 from userbot.bridge import MAX_RETRIES, Bridge, Identity, Incoming
 from userbot.content import Content, Quoted
 from userbot.harness import HHClient
@@ -43,6 +44,7 @@ class ScriptedAgent:
         "tg_draft_response",
         "tg_send_music",
         "tg_send_parsed_content",
+        "tg_send_inline_result",
         "tg_forward_message",
         "tg_add_schedule",
         "tg_send_file",
@@ -57,6 +59,7 @@ class ScriptedAgent:
         missing_details: bool = False,
         missing_parent: str | None = None,
         quiet: bool = False,
+        reasoning_chunks: int = 1,
         calls: list[tuple[str, dict]] | None = None,
     ) -> None:
         self.summary, self.details = summary, details
@@ -64,6 +67,7 @@ class ScriptedAgent:
         self.missing_details = missing_details
         self.missing_parent = missing_parent
         self.quiet = quiet  # never emits a delta: the turn produces nothing
+        self.reasoning_chunks = reasoning_chunks
         # Die mid-turn instead of reporting how it ended, for the tests that need
         # the link itself to be what breaks.
         self.hang_up = False
@@ -298,9 +302,10 @@ class ScriptedAgent:
             context_len=1,
         )
         if not self.quiet:
-            await conn.emit(
-                event="reasoning_delta", agent_id=block, round=1, text="想一想", chars=3
-            )
+            for _ in range(self.reasoning_chunks):
+                await conn.emit(
+                    event="reasoning_delta", agent_id=block, round=1, text="想一想", chars=3
+                )
         for index, (name, arguments) in enumerate(self.calls):
             call_id = self._call_id(index)
             await conn.emit(
@@ -592,6 +597,7 @@ async def run_bridge(
     delivery_ready=None,
     music_gate=None,
     transfer=None,
+    status_thinking=False,
 ):
     """Drive one message through the bridge; returns everything to assert on."""
     harness = await FakeHarness(agent).start()
@@ -608,6 +614,7 @@ async def run_bridge(
         store,
         delivery,
         status_interval=0.0,
+        status_thinking=status_thinking,
         identity=identity,
         music_gate=music_gate,
         transfer=transfer,
@@ -669,6 +676,8 @@ def test_a_mention_opens_a_conversation_and_delivers_the_draft(tmp_path):
                 "tg_search_music",
                 "tg_send_music",
                 "tg_send_parsed_content",
+                "tg_open_inline_menu",
+                "tg_send_inline_result",
                 "tg_download_file_to_sandbox",
                 "tg_send_file_from_sandbox",
                 "tg_send_file",
@@ -697,6 +706,8 @@ def test_a_mention_opens_a_conversation_and_delivers_the_draft(tmp_path):
                 "tg_search_music",
                 "tg_send_music",
                 "tg_send_parsed_content",
+                "tg_open_inline_menu",
+                "tg_send_inline_result",
                 "tg_download_file_to_sandbox",
                 "tg_send_file_from_sandbox",
                 "tg_send_file",
@@ -715,9 +726,7 @@ def test_a_mention_opens_a_conversation_and_delivers_the_draft(tmp_path):
             # the status message went out as a reply and was taken down again
             status, answer = delivery.sent[0], delivery.sent[1]
             assert status["reply_to"] == 50
-            assert delivery.edits, "the status message should have been edited"
-            assert any("🧠" in edit["text"] for edit in delivery.edits)
-            assert all("想一想" not in edit["text"] for edit in delivery.edits)  # not expanded
+            assert "🧠" in status["text"] and "想一想" not in status["text"]  # not expanded
             assert delivery.deleted == [(-100, (status["id"],))]
 
             # the answer: summary, then the details in a collapsed quote
@@ -756,6 +765,8 @@ def test_a_reply_continues_the_conversation_it_answered(tmp_path):
                 "tg_search_music",
                 "tg_send_music",
                 "tg_send_parsed_content",
+                "tg_open_inline_menu",
+                "tg_send_inline_result",
                 "tg_download_file_to_sandbox",
                 "tg_send_file_from_sandbox",
                 "tg_send_file",
@@ -1035,6 +1046,42 @@ def test_a_failure_before_the_reply_leaves_the_status_saying_so(tmp_path):
             failure = delivery.live()[-1]
             assert "agent failed" in failure["text"]
             assert store.lookup(-100, failure["id"]) is not None
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_the_first_thinking_chunk_opens_the_status_by_default(tmp_path):
+    agent = ScriptedAgent(reasoning_chunks=2)
+
+    async def scenario():
+        _, delivery, store = await run_bridge(agent, mention(), tmp_path)
+        try:
+            # the user sees the turn is under way the moment it starts thinking
+            assert delivery.sent[0]["text"] == "🧠 thinking · 3 chars"
+            # but the second chunk did not edit the message: its count (6) only
+            # rode along when the draft call touched the status
+            assert delivery.edits[0]["text"].startswith(
+                "🧠 thinking · 6 chars\n🔧 calling tg_draft_response"
+            )
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_the_thinking_count_edits_the_status_when_asked(tmp_path):
+    agent = ScriptedAgent(reasoning_chunks=2)
+
+    async def scenario():
+        _, delivery, store = await run_bridge(
+            agent, mention(), tmp_path, status_thinking=True
+        )
+        try:
+            assert delivery.sent[0]["text"] == "🧠 thinking · 3 chars"
+            # with the option on, the next chunk edits the message by itself
+            assert delivery.edits[0]["text"] == "🧠 thinking · 6 chars"
         finally:
             store.close()
 
@@ -1440,6 +1487,82 @@ def test_a_parse_that_never_answers_reaches_the_agent_as_an_error(tmp_path):
             assert agent.outcomes["call_1"] is False
             assert "said nothing within" in agent.answer_for("call_1")["error"]
             assert delivery.forwarded == []
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+# --- inline menus ------------------------------------------------------------
+
+
+def inline_menu(delivery, bot="like", query="cat", entries=None):
+    """A `delivery_ready` hook: what that bot's inline menu offers."""
+    delivery.inline[(bot, query)] = list(
+        entries
+        or [
+            {"title": "Grumpy Cat", "description": "a grumpy cat", "type": "gif"},
+            {"title": "Angry Cat", "type": "article"},
+        ]
+    )
+
+
+def test_an_inline_menu_is_opened_and_a_pick_is_sent(tmp_path, monkeypatch):
+    # the id the model carries from one call to the next, made readable here
+    monkeypatch.setattr(inline, "new_menu_id", lambda: "menu-test")
+    agent = ScriptedAgent(
+        calls=[
+            ("tg_open_inline_menu", {"bot": "@like", "query": "cat"}),
+            ("tg_send_inline_result", {"menu": "menu-test", "index": 2}),
+            ("tg_draft_response", {"summary": "发了", "details": "看上面。"}),
+        ]
+    )
+
+    async def scenario():
+        harness, delivery, store = await run_bridge(
+            agent, mention(), tmp_path, delivery_ready=inline_menu
+        )
+        try:
+            opened = agent.answer_for("call_1")["result"]
+            assert opened.startswith('menu menu-test (@like, asking for "cat"), 2 entries:')
+            assert "1. Grumpy Cat [gif] — a grumpy cat" in opened
+            assert "2. Angry Cat [article]" in opened
+
+            picked = agent.answer_for("call_2")["result"]
+            assert 'entry 2 of menu menu-test ("Angry Cat") was sent to the chat' == picked
+            sent = delivery.inline_sent[-1]
+            # the pick was sent into this chat, from that bot's menu
+            assert (sent["chat_id"], sent["bot"], sent["query"]) == (-100, "like", "cat")
+            assert sent["index"] == 1  # counted from zero by the time it reached Telegram
+            # the sent entry is the userbot's message: replying continues here
+            assert store.lookup(-100, sent["id"]) == harness.commands_named("fork")[0]["new_id"]
+        finally:
+            store.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_failed_turn_takes_the_inline_message_back(tmp_path, monkeypatch):
+    monkeypatch.setattr(inline, "new_menu_id", lambda: "menu-test")
+    agent = ScriptedAgent(
+        fail=True,
+        calls=[
+            ("tg_open_inline_menu", {"bot": "@like", "query": "cat"}),
+            ("tg_send_inline_result", {"menu": "menu-test", "index": 1}),
+            ("tg_draft_response", {"summary": "s", "details": "d"}),
+        ],
+    )
+
+    async def scenario():
+        _, delivery, store = await run_bridge(
+            agent, mention(), tmp_path, delivery_ready=inline_menu
+        )
+        try:
+            sent = delivery.inline_sent[-1]
+            assert (-100, (sent["id"],)) in delivery.deleted
+            # nothing of it is left to reply to
+            assert store.lookup(-100, sent["id"]) is None
+            assert "agent failed" in delivery.sent[-1]["text"]
         finally:
             store.close()
 

@@ -68,6 +68,31 @@ class DownloadedFile:
 
 
 @dataclass
+class InlineEntry:
+    """One thing a bot's inline menu offers, as the menu shows it."""
+
+    title: str = ""
+    description: str = ""
+    type: str = ""
+
+
+@dataclass
+class InlineMenu:
+    """A bot's inline menu: what one query fetched, and how to pick from it.
+
+    Sending an entry is not another query — Telegram holds the fetched results
+    only for a while, and the pick has to name the fetch they came from — so the
+    menu keeps the handle the sending side needs, opaque here. `bot` and `query`
+    say what it was asked, for the tools to describe it.
+    """
+
+    bot: str
+    query: str
+    entries: list[InlineEntry]
+    handle: object = field(default=None, repr=False, compare=False)
+
+
+@dataclass
 class Sender:
     """Who sent a message, as far as Telegram will say."""
 
@@ -168,6 +193,12 @@ class Delivery(Protocol):
         in it. A file too large to hand over, or a chat that cannot be read at
         all, is an error rather than a download.
         """
+
+    async def inline_query(self, bot: Entity, query: str) -> InlineMenu:
+        """Ask a bot for its inline menu: the entries it offers for one query."""
+
+    async def send_inline(self, menu: InlineMenu, index: int, chat_id: Entity) -> int:
+        """Send one entry of a fetched menu into a chat, returning its message id."""
 
 
 class _TelethonListener:
@@ -338,6 +369,31 @@ class TelethonDelivery:
                 f"is {MAX_FILE_BYTES}"
             )
         return DownloadedFile(name=found.file.name or "", data=raw)
+
+    async def inline_query(self, bot, query) -> InlineMenu:
+        fetched = await self.client.inline_query(bot, query)
+        return InlineMenu(
+            bot=bot,
+            query=query,
+            entries=[
+                InlineEntry(
+                    title=result.title or "",
+                    description=result.description or "",
+                    type=result.type or "",
+                )
+                for result in fetched
+            ],
+            handle=fetched,
+        )
+
+    async def send_inline(self, menu, index, chat_id) -> int:
+        # `click` is one request that names the query the entry was fetched with,
+        # so the message Telegram sends is the one that was picked — and it comes
+        # back through the random id every send carries.
+        sent = await menu.handle[index].click(entity=chat_id)
+        if sent is None:
+            raise ValueError("Telegram did not say which message the entry became")
+        return sent.id
 
 
 async def images_of(client, message, budget: int = MAX_IMAGES_BYTES) -> list[str]:

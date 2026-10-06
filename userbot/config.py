@@ -38,6 +38,7 @@ class Config:
     db_path: str
     max_db_bytes: int
     status_interval: float
+    status_thinking: bool
     turn_timeout: float
     log_level: str
 
@@ -113,6 +114,12 @@ class Config:
             help="minimum seconds between status message edits",
         )
         parser.add_argument(
+            "--status-thinking",
+            action="store_true",
+            default=_env_bool("USERBOT_STATUS_THINKING", False),
+            help="edit the status message as the thinking char count grows (default: off)",
+        )
+        parser.add_argument(
             "--turn-timeout",
             type=float,
             default=float(_env("USERBOT_TURN_TIMEOUT", "3600") or 3600),
@@ -134,6 +141,7 @@ class Config:
             db_path=args.db,
             max_db_bytes=args.max_db_bytes,
             status_interval=args.status_interval,
+            status_thinking=args.status_thinking,
             turn_timeout=args.turn_timeout,
             log_level=args.log_level,
         )

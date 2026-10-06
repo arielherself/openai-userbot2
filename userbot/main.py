@@ -142,6 +142,7 @@ async def serve(config: Config) -> None:
             store,
             TelethonDelivery(client),
             status_interval=config.status_interval,
+            status_thinking=config.status_thinking,
             turn_timeout=config.turn_timeout,
             model=config.model,
             identity=Identity(

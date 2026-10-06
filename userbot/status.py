@@ -1,11 +1,10 @@
 """The one Telegram message that follows a turn while it runs.
 
 The user asked something, so they get an answer to their message straight away:
-a status message that is edited in place as the agent thinks, calls tools and
-finally finishes. Editing is rate-limited — Telegram counts edits like sends,
-and a stream of deltas would otherwise turn into a flood — so an update that
-arrives too soon after the last is dropped, and the end of the turn is always
-published.
+a status message that is edited in place as the agent works and finally finishes.
+Editing is rate-limited — Telegram counts edits like sends, and a stream of
+deltas would otherwise turn into a flood — so an update that arrives too soon
+after the last is dropped, and the end of the turn is always published.
 
 What it says is deliberately bare — `🧠 thinking`, `🔧 calling web_search`,
 `✅ done` — rather than a sentence addressed to the reader: it is a trace of the

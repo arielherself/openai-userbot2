@@ -22,15 +22,18 @@ again first, on a fresh block, at most five times.
 ```
 you  ▶ @mybot 帮我把这段话翻译成英文：今天天气不错
 
-bot  ▶ 🧠 thinking · 1,234 chars                   ← edited as the turn runs
+bot  ▶ 🧠 thinking · 1,234 chars                   ← thinking has started; followed live with --status-thinking
 bot  ▶ 今天天气不错 → The weather is nice today.   ← the summary, a reply in itself
        ┃ The weather is nice today.                ← details, collapsed blockquote
 ```
 
 The status message is a trace of the turn rather than a sentence: the phase, how
-much thinking there has been on the thinking line itself, and which tool is being
-called — never its arguments or its result. Everything else becomes a line of its
-own below:
+much thinking there has been, and which tool is being called — never its
+arguments or its result. The thinking count is the one part that is **opt-in**:
+the first reasoning chunk always opens the message, so the turn is visibly under
+way, but after that the count does not edit it — it rides along with whatever
+update comes next, and `--status-thinking` makes the growing count drive the
+edits instead. Everything else becomes a line of its own below:
 
 ```
 🧠 thinking · 900 chars
@@ -220,6 +223,44 @@ under `[instant view content]`. A message with no text at all still says
 The userbot's own messages are sent with `link_preview=False`, so a reply that
 contains a link never grows a preview — and never an Instant View button.
 
+### Inline menus
+
+An inline menu is what a bot offers when its `@name` is typed into a chat box: a
+list of things it can send — a GIF, a picture, an article, a poll.
+
+| tool | what happens |
+|---|---|
+| `tg_open_inline_menu(bot, query?)` | asks a bot — [@like](https://t.me/like), [@gif](https://t.me/gif), [@bing](https://t.me/bing), any inline bot — for its menu, with a query after the name or with nothing typed, and hands the agent what it offers, numbered |
+| `tg_send_inline_result(menu, index)` | sends that entry into the chat, the way picking it by hand would: a message from this account, attributed to the bot |
+
+For films and TV shows there is [@pteebot](https://t.me/pteebot), whose menu
+searches for their resources; the agent is told about it in the tool's
+description.
+
+Unlike the other bots, an inline menu is not opened by sending a message and
+waiting for an answer: one request fetches it, and sending an entry is a pick
+*from that fetch* — Telegram keeps the fetched results only for a short while,
+and the send has to name the query they came from. So the menu stays in the
+userbot's memory between the two calls, under an id like `menu-1a2b3c4d5e6f`
+that the agent carries from the first tool to the second. At most **20 menus**
+are held, each for **10 minutes**; picking from one that was never opened, or
+whose time has run out, is a tool error, and the model is told to open it again.
+An empty menu is an answer, not a failure — the bot really may offer nothing.
+
+The listing prints one entry per line with its kind and what the bot says about
+it, so the pick can be made on what is there:
+
+```
+menu menu-1a2b3c4d5e6f (@gif, asking for "cat"), 2 entries:
+1. Grumpy Cat [gif] — a grumpy cat
+2. Angry Cat [article]
+```
+
+A pick that goes out is a message of the userbot's like any other — recorded
+against the block, so replying to it continues the conversation —
+and `tg_send_inline_result` declares a rollback, so a turn that fails after it
+deletes the message again.
+
 ### Scheduled tasks
 
 A task fires once, at a time the agent names, and its answer goes back where it was
@@ -374,6 +415,7 @@ uv run python -m userbot --harness-port 8765 --db userbot.db
 | `--db` | `USERBOT_DB` | `userbot.db` | the mapping store |
 | `--max-db-bytes` | `USERBOT_MAX_DB_BYTES` | 8 MiB | budget for that store |
 | `--status-interval` | `USERBOT_STATUS_INTERVAL` | `2.0` | minimum seconds between status edits |
+| `--status-thinking` | `USERBOT_STATUS_THINKING` | off | let the thinking char count edit the status message as it grows |
 | `--turn-timeout` | `USERBOT_TURN_TIMEOUT` | `3600` | give up on a turn after this long |
 | `--log-level` | `USERBOT_LOG_LEVEL` | `INFO` | logging |
 
@@ -410,7 +452,9 @@ against the block that produced it — `(chat_id, message_id) → agent_id`, plu
 root block per chat. Three kinds of message are recorded:
 
 1. every message of a delivered `tg_draft_response`;
-2. every track `tg_send_music` forwards into the chat;
+2. every message a tool puts into the chat — a track `tg_send_music` forwards, the
+   content `tg_send_parsed_content` forwards, an entry `tg_send_inline_result`
+   sends;
 3. the failure notice, when a turn fails after the block existed.
 
 Nothing else is: a reply to the status message, or to anything sent before the
@@ -436,12 +480,13 @@ auto-vacuum hands them back, so the file stays near the budget.
 - Replying to somebody else's message is quoted into the prompt; replying to the
   userbot's own message continues that conversation instead of quoting it back.
 - The local tools that post something — `tg_draft_response`, `tg_send_music`,
-  `tg_send_parsed_content`, `tg_send_file` — declare a rollback, so a turn that
-  fails after they did takes the messages back down (and drops their mappings)
-  before the failure notice explains what happened. `tg_add_schedule` declares one
-  too: the task it put on the list is cancelled again instead. A rollback reaches
-  a pipe's own step like any other call: a file `tg_send_file` posted is deleted
-  even though the model never made that call itself.
+  `tg_send_parsed_content`, `tg_send_inline_result`, `tg_send_file` — declare a
+  rollback, so a turn that fails after they did takes the messages back down
+  (and drops their mappings) before the failure notice explains what happened.
+  `tg_add_schedule` declares one too: the task it put on the list is cancelled
+  again instead. A rollback reaches a pipe's own step like any other call: a file
+  `tg_send_file` posted is deleted even though the model never made that call
+  itself.
 - **An attempt that did not get through is run again.** Three things count: the
   link to the harness going away; a provider request that never reached an answer
   at all (the harness reports the round it lost); and a provider that answered with
@@ -489,6 +534,7 @@ userbot/render.py    the draft: bold-only markdown, collapsed quote, splitting
 userbot/content.py   what a message carries: text, media placeholders, Instant Views
 userbot/music.py     the two tools that reach the music bot
 userbot/parse.py     the tool that has the parse bot render a link
+userbot/inline.py    the tools that open a bot's inline menu and send a pick
 userbot/history.py   the tools that read a chat, one message, or forward it
 userbot/schedule.py  the scheduled tasks: the three tools, and the clock that fires them
 userbot/sandbox.py   the sandbox pipes both ways: a chat's file in, a sandbox's file out

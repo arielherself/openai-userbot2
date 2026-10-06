@@ -42,6 +42,11 @@ from .history import current_chat as view_current_chat
 from .history import forward_message as forward_one_message
 from .history import public_chat as view_public_chat
 from .history import read_message as read_one_message
+from .inline import OPEN_TOOL as INLINE_OPEN_TOOL
+from .inline import SEND_TOOL as INLINE_SEND_TOOL
+from .inline import Menus, open_arguments, pick_arguments
+from .inline import open_menu as open_inline_menu
+from .inline import send_result as send_inline_result
 from .music import LOCAL_TIMEOUT, SEARCH_TOOL, SEND_TOOL, Gate, platform_names, resolve_platform
 from .music import search as search_music
 from .music import send as send_music
@@ -72,6 +77,8 @@ TOOL_NAME = TG_DRAFT_TOOL["name"]
 SEARCH_TOOL_NAME = SEARCH_TOOL["name"]
 SEND_TOOL_NAME = SEND_TOOL["name"]
 PARSE_TOOL_NAME = PARSE_TOOL["name"]
+INLINE_OPEN_TOOL_NAME = INLINE_OPEN_TOOL["name"]
+INLINE_SEND_TOOL_NAME = INLINE_SEND_TOOL["name"]
 VIEW_CURRENT_TOOL_NAME = VIEW_TOOLS[0]["name"]
 VIEW_PUBLIC_TOOL_NAME = VIEW_TOOLS[1]["name"]
 READ_TOOL_NAME = VIEW_TOOLS[2]["name"]
@@ -120,6 +127,8 @@ LOCAL_TOOLS = [
     SEARCH_TOOL,
     SEND_TOOL,
     PARSE_TOOL,
+    INLINE_OPEN_TOOL,
+    INLINE_SEND_TOOL,
     DOWNLOAD_TOOL,
     SEND_FROM_SANDBOX_TOOL,
     SEND_FILE_TOOL,
@@ -134,6 +143,7 @@ UNDOABLE = (
     SEARCH_TOOL_NAME,
     SEND_TOOL_NAME,
     PARSE_TOOL_NAME,
+    INLINE_SEND_TOOL_NAME,
     FORWARD_TOOL_NAME,
     ADD_SCHEDULE_TOOL_NAME,
     SEND_FILE_TOOL_NAME,
@@ -316,6 +326,7 @@ class Bridge:
         store,
         delivery,
         status_interval: float = 2.0,
+        status_thinking: bool = False,
         turn_timeout: float = 3600.0,
         model: str | None = None,
         identity: Identity | None = None,
@@ -327,6 +338,8 @@ class Bridge:
         self.store = store
         self.delivery = delivery
         self.status_interval = status_interval
+        # whether the thinking char count edits the status message as it grows
+        self.status_thinking = status_thinking
         self.turn_timeout = turn_timeout
         self.model = model
         self.identity = identity
@@ -334,6 +347,8 @@ class Bridge:
         self.retry_delay = retry_delay
         # one gate for the whole userbot: the music bot is shared between chats
         self.music_gate = music_gate if music_gate is not None else Gate()
+        # the inline menus that were opened and are still waiting to be picked from
+        self.inline_menus = Menus()
         # where a clone or a URL is fetched, on this side of the wire
         self.transfer = transfer if transfer is not None else CommandTransfer()
         # the turns running right now, by block, for `/inspect` to look at
@@ -601,8 +616,14 @@ class Bridge:
                     status.phase = "thinking"
                     await turn.tracker.update(status)
                 elif name == "reasoning_delta":
+                    # The first chunk always opens the status message — the user
+                    # has to see that the turn is under way — but after that the
+                    # count edits it only with `status_thinking`; otherwise it
+                    # just accumulates, and a later update carries the total.
+                    first = not status.reasoning
                     status.reasoning += event.get("chars") or len(event.get("text") or "")
-                    await turn.tracker.update(status)
+                    if self.status_thinking or first:
+                        await turn.tracker.update(status)
                 elif name == "content_delta":
                     status.content += event.get("chars") or len(event.get("text") or "")
                     await turn.tracker.update(status)
@@ -681,6 +702,10 @@ class Bridge:
             await self._send_music(turn, event, agent_id, call_id)
         elif name == PARSE_TOOL_NAME:
             await self._send_parsed(turn, event, agent_id, call_id)
+        elif name == INLINE_OPEN_TOOL_NAME:
+            await self._open_inline_menu(event, agent_id, call_id)
+        elif name == INLINE_SEND_TOOL_NAME:
+            await self._send_inline_result(turn, event, agent_id, call_id)
         elif name == DOWNLOAD_TOOL_NAME:
             await self._download_to_sandbox(event, agent_id, call_id)
         elif name == SEND_FROM_SANDBOX_TOOL_NAME:
@@ -787,6 +812,31 @@ class Bridge:
             return
         log.info("parsing %s for chat %s", url, turn.message.chat_id)
         answer = await send_parsed(self.delivery, url, turn.message.chat_id)
+        self._forwarded(turn, call_id, answer)
+        await self._answer(agent_id, call_id, answer)
+
+    async def _open_inline_menu(self, event: dict, agent_id: str, call_id: str) -> None:
+        """A bot's inline menu, fetched and kept for the pick that follows."""
+        bot, query, complaint = open_arguments(event.get("arguments") or {})
+        if complaint is not None:
+            await self.hh.resolve_tool(agent_id, call_id, error=complaint)
+            return
+        log.info("opening @%s's inline menu for %r", bot, query)
+        answer = await open_inline_menu(self.delivery, self.inline_menus, bot, query)
+        await self._answer(agent_id, call_id, answer)
+
+    async def _send_inline_result(
+        self, turn: _Turn, event: dict, agent_id: str, call_id: str
+    ) -> None:
+        """One entry of an opened menu, sent into this chat."""
+        menu_id, index, complaint = pick_arguments(event.get("arguments") or {})
+        if complaint is not None:
+            await self.hh.resolve_tool(agent_id, call_id, error=complaint)
+            return
+        log.info("sending entry %s of menu %s into chat %s", index, menu_id, turn.message.chat_id)
+        answer = await send_inline_result(
+            self.delivery, self.inline_menus, menu_id, index, turn.message.chat_id
+        )
         self._forwarded(turn, call_id, answer)
         await self._answer(agent_id, call_id, answer)
 

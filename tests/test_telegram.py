@@ -7,8 +7,8 @@ import base64
 from datetime import datetime, timezone
 
 import pytest
-from telethon import events
-from telethon.tl import types
+from telethon import events, functions
+from telethon.tl import custom, types
 from telethon.tl.custom import Message as TgMessage
 
 from userbot import telegram
@@ -33,6 +33,10 @@ class StubClient:
         self.fail_download = fail
         #: What `get_messages` hands back, for the tools that look one message up.
         self.found = None
+        #: What the inline bot offers: (type, title, description) per entry.
+        self.offered: list[tuple] = []
+        #: A response that never names the message, the way a failed map arrives.
+        self.no_response_id = False
         self.handlers: list[tuple] = []
         self.sent: list[dict] = []
         self.edits: list[dict] = []
@@ -40,6 +44,8 @@ class StubClient:
         self.forwarded: list[dict] = []
         self.downloaded: list[dict] = []
         self.files: list[dict] = []
+        self.inline_queried: list[dict] = []
+        self.requests: list = []
 
     async def send_message(self, chat_id, text, **fields):
         self.sent.append({"chat_id": chat_id, "text": text, **fields})
@@ -77,6 +83,53 @@ class StubClient:
 
     async def get_messages(self, entity, ids=None):
         return self.found
+
+    async def inline_query(self, bot, query):
+        self.inline_queried.append({"bot": bot, "query": query})
+        return custom.InlineResults(self, self.bot_results())
+
+    def bot_results(self):
+        """The answer to the inline query, shaped the way Telegram hands one over."""
+        return types.messages.BotResults(
+            query_id=991,
+            cache_time=300,
+            gallery=False,
+            results=[
+                types.BotInlineResult(
+                    id=str(index),
+                    type=kind,
+                    title=title,
+                    description=description,
+                    send_message=types.InputBotInlineMessageText(message=title),
+                )
+                for index, (kind, title, description) in enumerate(self.offered)
+            ],
+            users=[],
+            next_offset=None,
+            switch_pm=None,
+        )
+
+    async def get_input_entity(self, entity):
+        return entity
+
+    async def __call__(self, request, *args, **kwargs):
+        self.requests.append(request)
+        if self.no_response_id:
+            return types.Updates(updates=[], users=[], chats=[], date=None, seq=0)
+        return types.Updates(
+            updates=[types.UpdateMessageID(random_id=request.random_id, id=31)],
+            users=[],
+            chats=[],
+            date=None,
+            seq=0,
+        )
+
+    def _get_response_message(self, request, result, input_chat):
+        """What the real client reads out of the answer: the message that id names."""
+        for update in getattr(result, "updates", []):
+            if isinstance(update, types.UpdateMessageID):
+                return message(id=update.id, text="")
+        return None
 
 
 def message(id=5, text="", media=None, reply_markup=None, entities=None) -> TgMessage:
@@ -709,5 +762,55 @@ def test_a_preview_and_a_page_share_one_budget():
         )
         assert len(images) == 1
         assert len(client.downloaded) == 2  # the second was tried, then dropped
+
+    asyncio.run(scenario())
+
+
+# --- inline menus -------------------------------------------------------------
+
+
+def test_an_inline_query_lists_what_the_bot_offers():
+    async def scenario():
+        client = StubClient()
+        client.offered = [("gif", "Grumpy Cat", "a grumpy cat"), ("article", "Angry Cat", None)]
+        menu = await TelethonDelivery(client).inline_query("like", "cat")
+        assert client.inline_queried == [{"bot": "like", "query": "cat"}]
+        assert (menu.bot, menu.query) == ("like", "cat")
+        assert [(entry.title, entry.description, entry.type) for entry in menu.entries] == [
+            ("Grumpy Cat", "a grumpy cat", "gif"),
+            ("Angry Cat", "", "article"),
+        ]
+
+    asyncio.run(scenario())
+
+
+def test_a_pick_sends_the_entry_through_the_query_it_came_from():
+    async def scenario():
+        client = StubClient()
+        client.offered = [("gif", "Grumpy Cat", "a grumpy cat"), ("article", "Angry Cat", None)]
+        delivery = TelethonDelivery(client)
+        menu = await delivery.inline_query("like", "cat")
+
+        sent = await delivery.send_inline(menu, 1, -100)
+        assert sent == 31  # the id Telegram mapped this very send to
+        (request,) = client.requests
+        assert isinstance(request, functions.messages.SendInlineBotResultRequest)
+        # the pick names the fetch it came from: the entry id the bot gave, and
+        # the query id Telegram handed over with the fetch
+        assert request.query_id == 991
+        assert request.id == "1" and request.peer == -100
+
+    asyncio.run(scenario())
+
+
+def test_a_pick_telegram_does_not_map_back_is_an_error():
+    async def scenario():
+        client = StubClient()
+        client.offered = [("gif", "Grumpy Cat", "a grumpy cat")]
+        client.no_response_id = True
+        delivery = TelethonDelivery(client)
+        menu = await delivery.inline_query("like", "cat")
+        with pytest.raises(ValueError):
+            await delivery.send_inline(menu, 0, -100)
 
     asyncio.run(scenario())
